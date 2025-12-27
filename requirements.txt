@@ -1,7 +1,8 @@
-gradio
+streamlit
 pandas
 numpy
 requests
+beautifulsoup4
 lxml
 plotly
-statsmodels
+
