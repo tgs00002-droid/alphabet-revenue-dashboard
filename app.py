@@ -225,26 +225,13 @@ def load_revenue_by_segment_quarterly() -> pd.DataFrame:
     return tidy
 
 
-def compute_ttm_from_quarterly(tidy_q: pd.DataFrame) -> pd.DataFrame:
-    df = tidy_q.copy().sort_values(["product", "date"])
-    df["revenue_ttm"] = df.groupby("product")["revenue"].transform(lambda s: s.rolling(4, min_periods=4).sum())
-    out = df.dropna(subset=["revenue_ttm"]).rename(columns={"revenue_ttm": "revenue"})
-    return out[["date", "product", "revenue"]].reset_index(drop=True)
-
-
 def segment_sum_total_from_quarterly(seg_q: pd.DataFrame) -> pd.DataFrame:
     """
     Build TOTAL from the *true quarterly* segment row sums.
-    This fixes the issue where totals looked like TTM when user wanted Quarterly.
     """
     wide_q = seg_q.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index()
     wide_q = wide_q.dropna(how="all")
-
-    # Use ALL segment columns in the table (this matches your screenshot perfectly)
-    # because Search + Cloud + Subscriptions + YouTube + Network + Other Bets + Hedging
-    # sums to Yahoo Total Revenue (ex: 102.346B).
     total = wide_q.sum(axis=1, min_count=1)
-
     out = total.reset_index().rename(columns={0: "revenue"})
     out.columns = ["date", "revenue"]
     return out
@@ -370,7 +357,7 @@ with col2:
     st.markdown(
         """
         # Alphabet (Google) Revenue Forecast Dashboard
-        Interactive segment-level **quarterly + TTM** analysis and scenario forecasting.  
+        Interactive segment-level **quarterly** analysis and scenario forecasting.  
         Data sources: **StockAnalysis** (segment revenue) + **Yahoo Finance** (income statement).
         """
     )
@@ -389,20 +376,13 @@ if st.sidebar.button("Force Refresh (ignore cache)"):
 years = st.sidebar.slider("Forecast years", min_value=1, max_value=10, value=3, step=1)
 uplift = st.sidebar.slider("Extra CAGR uplift (scenario, annual)", min_value=0.00, max_value=0.30, value=0.00, step=0.01)
 
-view_mode = st.sidebar.radio(
-    "View mode",
-    ["Quarterly", "TTM (matches StockAnalysis chart)"],
-    index=0
-)
-
 
 # =============================
 # LOAD DATA
 # =============================
 seg_q = load_revenue_by_segment_quarterly()
-seg_active = seg_q if view_mode == "Quarterly" else compute_ttm_from_quarterly(seg_q)
 
-products = sorted(seg_active["product"].unique().tolist())
+products = sorted(seg_q["product"].unique().tolist())
 default_product = "Advertising" if "Advertising" in products else products[0]
 product = st.sidebar.selectbox("Product", products, index=products.index(default_product))
 
@@ -416,7 +396,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 
 # TAB 1
 with tab1:
-    seg = seg_active[seg_active["product"] == product].copy().sort_values("date")
+    seg = seg_q[seg_q["product"] == product].copy().sort_values("date")
     fc = forecast_series(seg[["date", "revenue"]], years=years, uplift_annual=uplift)
 
     end_fc = float(fc["forecast"].iloc[-1]) if not fc.empty else np.nan
@@ -429,7 +409,7 @@ with tab1:
     k2.metric("Δ vs Baseline", money_fmt(delta))
     k3.metric("Last Reported Quarter", pd.to_datetime(seg["date"].max()).strftime("%b %d, %Y"))
 
-    y_title = "Revenue (USD, Quarterly)" if view_mode == "Quarterly" else "Revenue (USD, TTM)"
+    y_title = "Revenue (USD, Quarterly)"
     fig = build_plot_lines(
         seg[["date", "revenue"]],
         fc,
@@ -438,30 +418,17 @@ with tab1:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# TAB 2 (TOTAL FIXED)
+# TAB 2 - FIXED: Always use quarterly data for forecasting
 with tab2:
-    # Historical TOTAL:
-    # - If Quarterly: sum the quarterly segment row (matches Yahoo Total Revenue)
-    # - If TTM: sum the TTM series (rolling 4Q)
-    if view_mode == "Quarterly":
-        total_hist = segment_sum_total_from_quarterly(seg_q)
-        y_title = "Revenue (USD, Quarterly)"
-        title_mode = "Quarterly"
-    else:
-        # TTM: build total by summing the already-built TTM segment series
-        wide_ttm = seg_active.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index()
-        total_hist = wide_ttm.sum(axis=1, min_count=1).reset_index().rename(columns={0: "revenue"})
-        total_hist.columns = ["date", "revenue"]
-        y_title = "Revenue (USD, TTM)"
-        title_mode = "TTM"
-
+    # Historical TOTAL from quarterly segment sums
+    total_hist = segment_sum_total_from_quarterly(seg_q)
     total_hist = total_hist.sort_values("date").dropna(subset=["revenue"])
 
-    # Forecast TOTAL by forecasting each segment (on the correct underlying mode)
-    wide = seg_active.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index().dropna(how="all")
+    # Forecast TOTAL by forecasting each segment using QUARTERLY data, then summing
+    wide_q = seg_q.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index().dropna(how="all")
 
     future_steps = years * 4
-    last_date = wide.index.max()
+    last_date = wide_q.index.max()
     future_dates = pd.date_range(last_date + pd.offsets.QuarterEnd(1), periods=future_steps, freq="Q")
     future_dates = pd.to_datetime(pd.Series(future_dates).apply(snap_to_quarter_end))
 
@@ -469,8 +436,9 @@ with tab2:
     total_hi_vals = np.zeros(future_steps, dtype=float)
     total_lo_vals = np.zeros(future_steps, dtype=float)
 
-    for p in wide.columns:
-        hist_p = wide[[p]].reset_index().rename(columns={p: "revenue"}).dropna(subset=["revenue"])
+    # CRITICAL FIX: Use seg_q (quarterly data) not seg_active
+    for p in wide_q.columns:
+        hist_p = wide_q[[p]].reset_index().rename(columns={p: "revenue"}).dropna(subset=["revenue"])
         if hist_p.empty:
             continue
         fcp = forecast_series(hist_p[["date", "revenue"]], years=years, uplift_annual=uplift)
@@ -485,8 +453,8 @@ with tab2:
     fig_total = build_plot_lines(
         total_hist[["date", "revenue"]],
         total_fc,
-        title=f"Total Alphabet Revenue Forecast ({title_mode}, Scenario)",
-        y_title=y_title
+        title=f"Total Alphabet Revenue Forecast (Quarterly, Scenario)",
+        y_title="Revenue (USD, Quarterly)"
     )
     st.plotly_chart(fig_total, use_container_width=True)
 
@@ -510,7 +478,7 @@ with tab2:
 
                 st.caption("If the difference is near $0, your segment total matches Yahoo Total Revenue for that quarter.")
             else:
-                st.caption("Yahoo Total Revenue doesn’t have the exact same quarter-end date loaded yet (still fine).")
+                st.caption("Yahoo Total Revenue doesn't have the exact same quarter-end date loaded yet (still fine).")
     except Exception:
         st.caption("Yahoo sanity check unavailable (scrape blocked or changed).")
 
@@ -543,23 +511,23 @@ with tab4:
 with tab5:
     st.subheader("Download data")
 
-    seg_download = seg_active.copy()
+    seg_download = seg_q.copy()
     seg_download["revenue"] = seg_download["revenue"].astype(float)
 
     st.download_button(
         label="Download segment dataset (tidy) as CSV",
         data=seg_download.to_csv(index=False).encode("utf-8"),
-        file_name=("alphabet_segments_quarterly.csv" if view_mode == "Quarterly" else "alphabet_segments_ttm.csv"),
+        file_name="alphabet_segments_quarterly.csv",
         mime="text/csv",
     )
 
-    wide_out = seg_active.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index()
+    wide_out = seg_q.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index()
     wide_out.reset_index(inplace=True)
 
     st.download_button(
         label="Download segment dataset (wide) as CSV",
         data=wide_out.to_csv(index=False).encode("utf-8"),
-        file_name=("alphabet_segments_wide_quarterly.csv" if view_mode == "Quarterly" else "alphabet_segments_wide_ttm.csv"),
+        file_name="alphabet_segments_wide_quarterly.csv",
         mime="text/csv",
     )
 
