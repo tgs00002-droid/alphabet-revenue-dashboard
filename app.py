@@ -82,12 +82,6 @@ def money_fmt(x: float) -> str:
 
 
 def snap_to_quarter_end(dt: pd.Timestamp) -> pd.Timestamp:
-    """
-    IMPORTANT FIX:
-    Yahoo sometimes hands back month-end dates that are NOT true quarter ends.
-    We snap to the next quarter end (QuarterEnd(0) => quarter-end on/after dt).
-    Example: Nov 30 -> Dec 31, Jan 31 -> Mar 31, May 31 -> Jun 30, etc.
-    """
     if pd.isna(dt):
         return dt
     dt = pd.Timestamp(dt).normalize()
@@ -128,7 +122,7 @@ def build_plot_lines(hist: pd.DataFrame, fc: pd.DataFrame, title: str, y_title: 
     fig.update_layout(
         title=title,
         height=520,
-        xaxis_title="Quarter",
+        xaxis_title="Quarter (Period Ending)",
         yaxis_title=y_title,
         hovermode="x unified",
         margin=dict(l=20, r=20, t=60, b=20),
@@ -144,13 +138,8 @@ def build_plot_lines(hist: pd.DataFrame, fc: pd.DataFrame, title: str, y_title: 
 
 def build_bar_income(df: pd.DataFrame, metric: str) -> go.Figure:
     d = df[df["metric"] == metric].sort_values("date").copy()
-
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=d["date"],
-        y=d["value"],
-        name=metric
-    ))
+    fig.add_trace(go.Bar(x=d["date"], y=d["value"], name=metric))
 
     ticks = quarter_tickvals(d["date"])
     fig.update_layout(
@@ -170,7 +159,7 @@ def build_bar_income(df: pd.DataFrame, metric: str) -> go.Figure:
 
 
 # =============================
-# STOCKANALYSIS SEGMENT SCRAPE
+# STOCKANALYSIS SEGMENT SCRAPE (QUARTERLY)
 # =============================
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def load_revenue_by_segment_quarterly() -> pd.DataFrame:
@@ -186,7 +175,6 @@ def load_revenue_by_segment_quarterly() -> pd.DataFrame:
             break
 
     table = history_h.find_next("table") if history_h else None
-
     if table is None:
         tables = soup.find_all("table")
         if not tables:
@@ -195,8 +183,7 @@ def load_revenue_by_segment_quarterly() -> pd.DataFrame:
 
     thead = table.find("thead")
     if thead:
-        header_cells = thead.find_all(["th", "td"])
-        headers = [c.get_text(" ", strip=True) for c in header_cells]
+        headers = [c.get_text(" ", strip=True) for c in thead.find_all(["th", "td"])]
     else:
         first_row = table.find("tr")
         headers = [c.get_text(" ", strip=True) for c in first_row.find_all(["th", "td"])]
@@ -232,7 +219,6 @@ def load_revenue_by_segment_quarterly() -> pd.DataFrame:
             wide[c] = wide[c].apply(money_to_float)
 
     wide = wide.sort_values("date").reset_index(drop=True)
-
     tidy = wide.melt("date", var_name="product", value_name="revenue").dropna()
     tidy = tidy.sort_values(["product", "date"]).reset_index(drop=True)
     tidy["date"] = pd.to_datetime(tidy["date"])
@@ -240,34 +226,28 @@ def load_revenue_by_segment_quarterly() -> pd.DataFrame:
 
 
 def compute_ttm_from_quarterly(tidy_q: pd.DataFrame) -> pd.DataFrame:
-    df = tidy_q.copy()
-    df = df.sort_values(["product", "date"])
+    df = tidy_q.copy().sort_values(["product", "date"])
     df["revenue_ttm"] = df.groupby("product")["revenue"].transform(lambda s: s.rolling(4, min_periods=4).sum())
     out = df.dropna(subset=["revenue_ttm"]).rename(columns={"revenue_ttm": "revenue"})
     return out[["date", "product", "revenue"]].reset_index(drop=True)
 
 
-def pick_total_components(cols: List[str]) -> List[str]:
-    preferred_leaf = [
-        "Google Search & Other",
-        "YouTube Ads",
-        "Google Network",
-        "Google Cloud",
-        "Google Subscriptions, Platforms & Devices",
-        "Other Bets",
-        "Hedging Gains",
-    ]
-    available_leaf = [c for c in preferred_leaf if c in cols]
+def segment_sum_total_from_quarterly(seg_q: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build TOTAL from the *true quarterly* segment row sums.
+    This fixes the issue where totals looked like TTM when user wanted Quarterly.
+    """
+    wide_q = seg_q.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index()
+    wide_q = wide_q.dropna(how="all")
 
-    ad_components = ["Google Search & Other", "YouTube Ads", "Google Network"]
-    has_components = all(c in cols for c in ad_components)
+    # Use ALL segment columns in the table (this matches your screenshot perfectly)
+    # because Search + Cloud + Subscriptions + YouTube + Network + Other Bets + Hedging
+    # sums to Yahoo Total Revenue (ex: 102.346B).
+    total = wide_q.sum(axis=1, min_count=1)
 
-    comps = available_leaf if available_leaf else cols.copy()
-
-    if has_components and "Advertising" in comps:
-        comps = [c for c in comps if c != "Advertising"]
-
-    return comps
+    out = total.reset_index().rename(columns={0: "revenue"})
+    out.columns = ["date", "revenue"]
+    return out
 
 
 # =============================
@@ -277,12 +257,10 @@ def estimate_growth_q(series: pd.Series, lookback_quarters: int = 8) -> Tuple[fl
     s = series.dropna().astype(float)
     if len(s) < 6:
         return 0.02, 0.05
-
     s = s.iloc[-lookback_quarters:] if len(s) > lookback_quarters else s
     g = s.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     if len(g) < 3:
         return 0.02, 0.05
-
     return float(g.mean()), float(g.std(ddof=1) if len(g) > 1 else 0.05)
 
 
@@ -296,7 +274,6 @@ def forecast_series(hist_df: pd.DataFrame, years: int, uplift_annual: float, loo
     last_val = float(df.loc[df["date"] == last_date, "revenue"].iloc[-1])
 
     mean_q, std_q = estimate_growth_q(df["revenue"], lookback_quarters=lookback_quarters)
-
     uplift_q = (1.0 + uplift_annual) ** (1.0 / 4.0) - 1.0
     q_growth = mean_q + uplift_q
 
@@ -309,7 +286,6 @@ def forecast_series(hist_df: pd.DataFrame, years: int, uplift_annual: float, loo
     for i in range(1, steps + 1):
         cur = cur * (1.0 + q_growth)
         fc.append(cur)
-
         band = (std_q if std_q > 0 else 0.05) * np.sqrt(i)
         hi.append(cur * (1.0 + band))
         lo.append(cur * (1.0 - band))
@@ -318,7 +294,7 @@ def forecast_series(hist_df: pd.DataFrame, years: int, uplift_annual: float, loo
 
 
 # =============================
-# YAHOO INCOME STATEMENT SCRAPE (FIXED DATES)
+# YAHOO INCOME STATEMENT (QUARTERLY, DATES SNAPPED)
 # =============================
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def load_yahoo_income_quarterly() -> pd.DataFrame:
@@ -331,7 +307,6 @@ def load_yahoo_income_quarterly() -> pd.DataFrame:
         raise ValueError("Could not find Yahoo embedded JSON (root.App.main).")
 
     data = json.loads(m.group(1))
-
     stores = data.get("context", {}).get("dispatcher", {}).get("stores", {})
     qss = stores.get("QuoteSummaryStore", {})
 
@@ -345,9 +320,7 @@ def load_yahoo_income_quarterly() -> pd.DataFrame:
         if end is None:
             continue
 
-        # Convert unix to timestamp (Yahoo uses seconds)
         dt = pd.to_datetime(int(end), unit="s", errors="coerce")
-        # KEY FIX: snap to true quarter-end (end of month, quarter-end)
         dt = snap_to_quarter_end(dt)
 
         for k, v in entry.items():
@@ -406,10 +379,9 @@ st.markdown("---")
 
 
 # =============================
-# SIDEBAR CONTROLS
+# SIDEBAR
 # =============================
 st.sidebar.title("Controls")
-
 if st.sidebar.button("Force Refresh (ignore cache)"):
     st.cache_data.clear()
     st.rerun()
@@ -442,7 +414,6 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["Segment Forecast", "Total Forecast", "Segment Table Check", "Income Statement", "Download"]
 )
 
-
 # TAB 1
 with tab1:
     seg = seg_active[seg_active["product"] == product].copy().sort_values("date")
@@ -467,17 +438,27 @@ with tab1:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-
-# TAB 2
+# TAB 2 (TOTAL FIXED)
 with tab2:
-    wide = seg_active.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index()
-    wide = wide.dropna(how="all")
+    # Historical TOTAL:
+    # - If Quarterly: sum the quarterly segment row (matches Yahoo Total Revenue)
+    # - If TTM: sum the TTM series (rolling 4Q)
+    if view_mode == "Quarterly":
+        total_hist = segment_sum_total_from_quarterly(seg_q)
+        y_title = "Revenue (USD, Quarterly)"
+        title_mode = "Quarterly"
+    else:
+        # TTM: build total by summing the already-built TTM segment series
+        wide_ttm = seg_active.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index()
+        total_hist = wide_ttm.sum(axis=1, min_count=1).reset_index().rename(columns={0: "revenue"})
+        total_hist.columns = ["date", "revenue"]
+        y_title = "Revenue (USD, TTM)"
+        title_mode = "TTM"
 
-    cols = list(wide.columns)
-    total_components = pick_total_components(cols)
+    total_hist = total_hist.sort_values("date").dropna(subset=["revenue"])
 
-    wide["TOTAL"] = wide[total_components].sum(axis=1, min_count=1)
-    total_hist = wide["TOTAL"].reset_index().rename(columns={"TOTAL": "revenue"})
+    # Forecast TOTAL by forecasting each segment (on the correct underlying mode)
+    wide = seg_active.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index().dropna(how="all")
 
     future_steps = years * 4
     last_date = wide.index.max()
@@ -488,7 +469,7 @@ with tab2:
     total_hi_vals = np.zeros(future_steps, dtype=float)
     total_lo_vals = np.zeros(future_steps, dtype=float)
 
-    for p in total_components:
+    for p in wide.columns:
         hist_p = wide[[p]].reset_index().rename(columns={p: "revenue"}).dropna(subset=["revenue"])
         if hist_p.empty:
             continue
@@ -501,9 +482,6 @@ with tab2:
 
     total_fc = pd.DataFrame({"date": future_dates, "forecast": total_fc_vals, "hi": total_hi_vals, "lo": total_lo_vals})
 
-    title_mode = "Quarterly" if view_mode == "Quarterly" else "TTM"
-    y_title = "Revenue (USD, Quarterly)" if view_mode == "Quarterly" else "Revenue (USD, TTM)"
-
     fig_total = build_plot_lines(
         total_hist[["date", "revenue"]],
         total_fc,
@@ -511,8 +489,30 @@ with tab2:
         y_title=y_title
     )
     st.plotly_chart(fig_total, use_container_width=True)
-    st.caption("Total uses non-overlapping segment components to avoid double counting.")
 
+    # Sanity check vs Yahoo Total Revenue (quarterly)
+    try:
+        inc = load_yahoo_income_quarterly()
+        yrev = inc[inc["metric"] == "Total Revenue"].sort_values("date")
+        if not yrev.empty:
+            last_q = total_hist["date"].max()
+            seg_total_last = float(total_hist.loc[total_hist["date"] == last_q, "revenue"].iloc[-1])
+
+            ymatch = yrev[yrev["date"] == last_q]
+            if not ymatch.empty:
+                yahoo_last = float(ymatch["value"].iloc[-1])
+                diff = seg_total_last - yahoo_last
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Segment-sum TOTAL (last quarter)", money_fmt(seg_total_last))
+                c2.metric("Yahoo Total Revenue (same quarter)", money_fmt(yahoo_last))
+                c3.metric("Difference", money_fmt(diff))
+
+                st.caption("If the difference is near $0, your segment total matches Yahoo Total Revenue for that quarter.")
+            else:
+                st.caption("Yahoo Total Revenue doesn’t have the exact same quarter-end date loaded yet (still fine).")
+    except Exception:
+        st.caption("Yahoo sanity check unavailable (scrape blocked or changed).")
 
 # TAB 3
 with tab3:
@@ -523,11 +523,9 @@ with tab3:
     st.write(f"Latest quarter in StockAnalysis table: **{pd.to_datetime(latest_dt).strftime('%b %d, %Y')}**")
     st.dataframe(chk[["product", "revenue_fmt"]], use_container_width=True)
 
-
-# TAB 4 (INCOME STATEMENT FIXED)
+# TAB 4
 with tab4:
     st.subheader("Income Statement (Yahoo Finance: GOOGL)")
-
     inc = load_yahoo_income_quarterly()
     metric_list = sorted(inc["metric"].unique().tolist())
     default_metric = "Total Revenue" if "Total Revenue" in metric_list else metric_list[0]
@@ -536,12 +534,10 @@ with tab4:
     fig_inc = build_bar_income(inc, metric)
     st.plotly_chart(fig_inc, use_container_width=True)
 
-    # Table view with proper period ending
     mdf = inc[inc["metric"] == metric].sort_values("date", ascending=False).copy()
     mdf["Period Ending"] = pd.to_datetime(mdf["date"]).dt.strftime("%b %d, %Y")
     mdf["Value"] = mdf["value"].apply(money_fmt)
     st.dataframe(mdf[["Period Ending", "Value"]], use_container_width=True)
-
 
 # TAB 5
 with tab5:
