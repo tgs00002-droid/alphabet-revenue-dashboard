@@ -1,0 +1,26 @@
+name: Update Google Financial Data
+
+on:
+  schedule:
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: pip install pandas lxml requests
+
+      - name: Run scraper
+        run: python scripts/scrape_stockanalysis.py
+
+      - name: Commit data
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/*.csv
+          git commit -m "Update StockAnalysis data" || echo "No changes"
+          git push
