@@ -660,4 +660,124 @@ with tab3:
     
     # Historical data availability
     st.markdown("---")
-    st.subheader("Data Availability by
+    st.subheader("Data Availability by Segment")
+    
+    avail = seg_q.groupby("product").agg(
+        first_date=("date", "min"),
+        last_date=("date", "max"),
+        num_quarters=("date", "count")
+    ).reset_index()
+    avail["first_date"] = pd.to_datetime(avail["first_date"]).dt.strftime("%b %Y")
+    avail["last_date"] = pd.to_datetime(avail["last_date"]).dt.strftime("%b %Y")
+    
+    st.dataframe(
+        avail.rename(columns={
+            "product": "Segment",
+            "first_date": "First Quarter",
+            "last_date": "Last Quarter",
+            "num_quarters": "# Quarters"
+        }),
+        use_container_width=True,
+        hide_index=True
+    )
+
+# TAB 4: INCOME STATEMENT
+with tab4:
+    st.subheader("📊 Income Statement (Yahoo Finance: GOOGL)")
+    
+    try:
+        inc = load_yahoo_income_quarterly()
+        
+        if inc.empty:
+            st.warning("⚠️ Yahoo Finance data is currently unavailable. This may be due to rate limiting or site changes.")
+            st.info("💡 The segment forecasts in other tabs are still accurate and use StockAnalysis data.")
+        else:
+            metric_list = sorted(inc["metric"].unique().tolist())
+            default_metric = "Total Revenue" if "Total Revenue" in metric_list else (metric_list[0] if metric_list else None)
+            
+            if default_metric:
+                metric = st.selectbox("Select Metric", metric_list, index=metric_list.index(default_metric))
+
+                fig_inc = build_bar_income(inc, metric)
+                st.plotly_chart(fig_inc, use_container_width=True)
+
+                # Data table
+                mdf = inc[inc["metric"] == metric].sort_values("date", ascending=False).copy()
+                mdf["Period Ending"] = pd.to_datetime(mdf["date"]).dt.strftime("%b %Y")
+                mdf["Value"] = mdf["value"].apply(money_fmt)
+                
+                # Calculate YoY growth if enough data
+                if len(mdf) >= 5:
+                    mdf_sorted = mdf.sort_values("date")
+                    mdf_sorted["YoY Growth"] = mdf_sorted["value"].pct_change(4)
+                    mdf = mdf_sorted.sort_values("date", ascending=False)
+                    mdf["YoY Growth"] = mdf["YoY Growth"].apply(lambda x: f"{x*100:.1f}%" if not np.isnan(x) else "—")
+                    cols_to_show = ["Period Ending", "Value", "YoY Growth"]
+                else:
+                    cols_to_show = ["Period Ending", "Value"]
+                
+                st.dataframe(mdf[cols_to_show], use_container_width=True, hide_index=True)
+            else:
+                st.warning("No metrics available in Yahoo data")
+                
+    except Exception as e:
+        st.error(f"Error loading Yahoo Finance data: {str(e)}")
+        st.info("This tab requires Yahoo Finance access. The other tabs work independently using StockAnalysis data.")
+
+# TAB 5: DOWNLOAD
+with tab5:
+    st.subheader("⬇️ Download Data")
+
+    st.markdown("Export the underlying data used in this dashboard for further analysis.")
+    
+    # Segment data (tidy format)
+    seg_download = seg_q.copy()
+    seg_download["revenue"] = seg_download["revenue"].astype(float)
+    seg_download["date"] = pd.to_datetime(seg_download["date"]).dt.strftime("%Y-%m-%d")
+
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.download_button(
+            label="📥 Download Segment Data (Tidy Format)",
+            data=seg_download.to_csv(index=False).encode("utf-8"),
+            file_name="alphabet_segments_quarterly_tidy.csv",
+            mime="text/csv",
+            help="Long format with columns: date, product, revenue"
+        )
+
+    # Segment data (wide format)
+    wide_out = seg_q.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index()
+    wide_out.reset_index(inplace=True)
+    wide_out["date"] = pd.to_datetime(wide_out["date"]).dt.strftime("%Y-%m-%d")
+    
+    with col2:
+        st.download_button(
+            label="📥 Download Segment Data (Wide Format)",
+            data=wide_out.to_csv(index=False).encode("utf-8"),
+            file_name="alphabet_segments_quarterly_wide.csv",
+            mime="text/csv",
+            help="Wide format with date as rows and segments as columns"
+        )
+
+    # Yahoo income statement
+    try:
+        inc = load_yahoo_income_quarterly()
+        if not inc.empty:
+            inc_download = inc.copy()
+            inc_download["date"] = pd.to_datetime(inc_download["date"]).dt.strftime("%Y-%m-%d")
+            
+            st.download_button(
+                label="📥 Download Income Statement (Yahoo Finance)",
+                data=inc_download.to_csv(index=False).encode("utf-8"),
+                file_name="yahoo_income_statement_quarterly.csv",
+                mime="text/csv",
+                help="Quarterly income statement metrics from Yahoo Finance"
+            )
+        else:
+            st.info("Yahoo Finance data not available for download")
+    except:
+        st.info("Yahoo Finance data not available for download")
+    
+    st.markdown("---")
+    st.caption("💾 All data is exported in CSV format for easy import into Excel, Python, R, or other analysis tools.")
