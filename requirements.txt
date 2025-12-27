@@ -5,4 +5,4 @@ requests
 beautifulsoup4
 lxml
 plotly
-
+yfinance
