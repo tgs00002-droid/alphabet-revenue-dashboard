@@ -1,0 +1,7 @@
+gradio
+pandas
+numpy
+requests
+lxml
+plotly
+statsmodels
