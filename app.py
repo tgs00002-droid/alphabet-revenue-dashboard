@@ -1,434 +1,533 @@
+import io
 import re
+import math
 import numpy as np
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
-
-import plotly.graph_objects as go
 import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
 
-# -----------------------------
+# =========================
 # CONFIG
-# -----------------------------
-SOURCE_URL = "https://stockanalysis.com/stocks/goog/metrics/revenue-by-segment/"
-UA_HEADERS = {"User-Agent": "Mozilla/5.0"}
+# =========================
+SEGMENT_URL = "https://stockanalysis.com/stocks/goog/metrics/revenue-by-segment/"
+FINANCIALS_URL = "https://stockanalysis.com/stocks/goog/financials/"
 
-st.set_page_config(
-    page_title="Alphabet (Google) Revenue Forecast Dashboard",
-    layout="wide",
-)
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-# -----------------------------
-# PARSING HELPERS
-# -----------------------------
-def money_to_float(x: str) -> float:
-    """
-    Convert strings like '215.49B', '39.00M', '-56.00M', '0', '' to float USD.
-    """
-    if x is None:
+st.set_page_config(page_title="Alphabet Revenue Forecast Dashboard", layout="wide")
+
+# =========================
+# HELPERS
+# =========================
+def parse_money_to_float(x):
+    """Convert strings like '56.57B', '344.00M', '-207.00M', '1.2T' to float dollars."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return np.nan
     s = str(x).strip()
-    if s == "" or s.lower() == "nan":
+
+    if s in ["", "—", "-", "None", "nan", "NaN"]:
         return np.nan
 
-    s = s.replace(",", "").replace("−", "-").replace("\xa0", " ")
+    # remove commas and $ signs
+    s = s.replace(",", "").replace("$", "")
 
-    # Try plain numeric
-    try:
-        return float(s)
-    except Exception:
-        pass
+    # Handle parentheses negatives e.g. (1.23B)
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1].strip()
+
+    # Match number + suffix
+    m = re.match(r"^(-?\d+(\.\d+)?)([KMBT])?$", s, re.IGNORECASE)
+    if not m:
+        # Sometimes it's just a raw number
+        try:
+            val = float(s)
+            return -val if neg else val
+        except:
+            return np.nan
+
+    num = float(m.group(1))
+    suf = (m.group(3) or "").upper()
 
     mult = 1.0
-    if s.endswith("T"):
-        mult = 1e12
-        s = s[:-1]
-    elif s.endswith("B"):
-        mult = 1e9
-        s = s[:-1]
-    elif s.endswith("M"):
-        mult = 1e6
-        s = s[:-1]
-    elif s.endswith("K"):
+    if suf == "K":
         mult = 1e3
-        s = s[:-1]
+    elif suf == "M":
+        mult = 1e6
+    elif suf == "B":
+        mult = 1e9
+    elif suf == "T":
+        mult = 1e12
 
-    try:
-        return float(s) * mult
-    except Exception:
-        m = re.search(r"-?\d+(\.\d+)?", s)
-        return float(m.group(0)) * mult if m else np.nan
+    val = num * mult
+    if neg:
+        val = -val
+    return val
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
-def load_revenue_by_segment_wide() -> pd.DataFrame:
-    """
-    Scrape the History table and return a wide dataframe:
-      date + one column per segment (values as float USD)
-    """
-    r = requests.get(SOURCE_URL, headers=UA_HEADERS, timeout=30)
+def fetch_tables(url):
+    """Fetch HTML and return list of tables via pandas.read_html."""
+    r = requests.get(url, headers=UA_HEADERS, timeout=30)
     r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "lxml")
-
-    # Try to find the History section
-    history_h2 = None
-    for h in soup.find_all(["h2", "h3"]):
-        if h.get_text(strip=True).lower() == "history":
-            history_h2 = h
-            break
-
-    table = history_h2.find_next("table") if history_h2 else None
-
-    # Fallback: largest table
-    if table is None:
-        tables = soup.find_all("table")
-        if not tables:
-            raise ValueError("No tables found on the page.")
-        table = max(tables, key=lambda t: len(t.find_all("tr")))
-
-    # Headers
-    thead = table.find("thead")
-    if thead:
-        header_cells = thead.find_all(["th", "td"])
-        headers = [c.get_text(" ", strip=True) for c in header_cells]
-    else:
-        first_row = table.find("tr")
-        headers = [c.get_text(" ", strip=True) for c in first_row.find_all(["th", "td"])]
-
-    headers = [h.replace("\xa0", " ").strip() for h in headers]
-    if headers and headers[0].lower() != "date":
-        headers[0] = "Date"
-
-    # Rows
-    rows = []
-    tbody = table.find("tbody") or table
-    for tr in tbody.find_all("tr"):
-        cells = tr.find_all(["td", "th"])
-        if not cells:
-            continue
-        vals = [c.get_text(" ", strip=True).replace("\xa0", " ") for c in cells]
-
-        if vals and vals[0].lower() == "date":
-            continue
-
-        if len(vals) < len(headers):
-            vals += [""] * (len(headers) - len(vals))
-        if len(vals) > len(headers):
-            vals = vals[:len(headers)]
-
-        rows.append(vals)
-
-    wide = pd.DataFrame(rows, columns=headers)
-
-    wide.rename(columns={"Date": "date"}, inplace=True)
-    wide["date"] = pd.to_datetime(wide["date"], errors="coerce")
-
-    for c in wide.columns:
-        if c != "date":
-            wide[c] = wide[c].apply(money_to_float)
-
-    wide = wide.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-    return wide
+    html = r.text
+    tables = pd.read_html(io.StringIO(html))
+    return tables
 
 
-# -----------------------------
-# TTM -> QUARTERLY CONVERSION
-# -----------------------------
-def ttm_to_quarterly(ttm: pd.Series, seed_method: str = "ttm_div_4") -> pd.Series:
+def standardize_quarter_date(col):
     """
-    Convert a TTM quarterly series into an estimated quarterly series.
-
-    Recurrence:
-      Q_t = TTM_t - TTM_{t-1} + Q_{t-4}
-
-    Needs seeding for first 4 quarters.
-    seed_method:
-      - "ttm_div_4": Q_0..Q_3 = TTM_0/4, TTM_1/4, TTM_2/4, TTM_3/4  (simple, stable)
+    Convert quarter-like headers into timestamps.
+    StockAnalysis often uses like 'Sep 30, 2025'.
     """
-    s = ttm.astype(float).copy()
-    q = pd.Series(index=s.index, dtype=float)
+    try:
+        return pd.to_datetime(col)
+    except:
+        return None
 
-    if len(s) == 0:
-        return q
 
-    # Seed first 4
-    for i in range(min(4, len(s))):
-        if seed_method == "ttm_div_4":
-            q.iloc[i] = s.iloc[i] / 4.0
-        else:
-            q.iloc[i] = s.iloc[i] / 4.0
+def wide_table_to_long_quarters(df_wide, label_col="Segment"):
+    """
+    Convert wide table:
+    Segment | Sep 30, 2025 | Jun 30, 2025 | ...
+    -> long:
+    date, segment, value
+    """
+    df = df_wide.copy()
+    df.columns = [str(c).strip() for c in df.columns]
 
-    # Recurrence for the rest
-    for i in range(4, len(s)):
-        if pd.isna(s.iloc[i]) or pd.isna(s.iloc[i - 1]) or pd.isna(q.iloc[i - 4]):
-            q.iloc[i] = np.nan
-        else:
-            q.iloc[i] = (s.iloc[i] - s.iloc[i - 1]) + q.iloc[i - 4]
+    # Find segment column name
+    if label_col not in df.columns:
+        # try first column
+        label_col = df.columns[0]
 
+    # Identify date columns
+    date_cols = []
+    for c in df.columns:
+        if c == label_col:
+            continue
+        dt = standardize_quarter_date(c)
+        if dt is not None:
+            date_cols.append(c)
+
+    if not date_cols:
+        # Nothing to parse
+        return pd.DataFrame(columns=["date", "segment", "value"])
+
+    # Melt
+    tidy = df.melt(id_vars=[label_col], value_vars=date_cols,
+                   var_name="date", value_name="value")
+    tidy.rename(columns={label_col: "segment"}, inplace=True)
+
+    tidy["date"] = pd.to_datetime(tidy["date"])
+    tidy["value"] = tidy["value"].apply(parse_money_to_float)
+    tidy = tidy.dropna(subset=["value"])
+
+    # Sort oldest -> newest
+    tidy = tidy.sort_values(["segment", "date"]).reset_index(drop=True)
+    return tidy
+
+
+def ttm_to_quarterly(ttm_long):
+    """
+    Correct conversion:
+    Quarter(t) = TTM(t) - TTM(t-1)
+    Per segment.
+    """
+    df = ttm_long.copy().sort_values(["segment", "date"])
+    df["value_q"] = df.groupby("segment")["value"].diff(1)
+    q = df.dropna(subset=["value_q"]).copy()
+    q.rename(columns={"value_q": "value"}, inplace=True)
+    q = q[["date", "segment", "value"]].sort_values(["segment", "date"]).reset_index(drop=True)
     return q
 
 
-def convert_wide_ttm_to_quarterly(wide: pd.DataFrame) -> pd.DataFrame:
+@st.cache_data(ttl=60 * 60)
+def load_segment_quarterly():
     """
-    Apply TTM->Quarterly conversion to every segment column.
-    Returns a new wide dataframe (same columns), with quarterly values.
+    Try to get the QUARTERLY segment table directly.
+    If only TTM exists, convert TTM -> quarterly properly.
     """
-    out = wide.copy()
-    for c in out.columns:
-        if c == "date":
-            continue
-        out[c] = ttm_to_quarterly(out[c], seed_method="ttm_div_4")
-    return out
+    tables = fetch_tables(SEGMENT_URL)
+
+    # Heuristic: pick a table that contains segment names like "Google Search" etc.
+    candidate = None
+    for t in tables:
+        cols = [str(c).lower() for c in t.columns]
+        firstcol = str(t.columns[0]).lower()
+        if "segment" in firstcol or "segment" in " ".join(cols):
+            # likely the segment table
+            if t.shape[1] >= 4:
+                candidate = t
+                break
+
+    if candidate is None:
+        raise ValueError("Could not find segment table on the page.")
+
+    # Convert wide -> long (attempt as quarterly)
+    long_try = wide_table_to_long_quarters(candidate, label_col=candidate.columns[0])
+
+    # Detect if it's TTM by checking if there is a column literally named "TTM"
+    # or if the page served a TTM table instead of quarter dates.
+    is_ttm = False
+    raw_cols = [str(c).strip().upper() for c in candidate.columns]
+    if "TTM" in raw_cols:
+        is_ttm = True
+
+    # Another detection: if dates exist but are not quarters and only one per year etc.
+    # We'll primarily rely on explicit "TTM" or user scenario.
+    if is_ttm:
+        # If candidate includes a TTM column, reshape differently:
+        # Expect: Segment | TTM | ... (maybe multiple)
+        # We'll treat each date-like column as period, but if no dates, we cannot forecast.
+        # Try to find any date columns in candidate; if none, fallback fail.
+        ttm_long = wide_table_to_long_quarters(candidate, label_col=candidate.columns[0])
+        if ttm_long.empty:
+            raise ValueError("TTM table found but no time columns to convert.")
+        q = ttm_to_quarterly(ttm_long)
+        return q
+
+    # If not flagged TTM, assume it's already quarterly
+    # But if it looks like TTM (few columns, no quarter dates), try a different table
+    if long_try.empty:
+        # attempt: find any other table with many date columns
+        best = None
+        best_count = 0
+        for t in tables:
+            temp = wide_table_to_long_quarters(t, label_col=t.columns[0])
+            if temp.shape[0] > best_count:
+                best = temp
+                best_count = temp.shape[0]
+        if best is None or best.empty:
+            raise ValueError("Could not parse any quarterly time series from the segment page.")
+        return best
+
+    return long_try
 
 
-# -----------------------------
-# FORECAST
-# -----------------------------
-def estimate_qoq_growth(series: pd.Series, lookback_quarters: int = 8) -> tuple[float, float]:
-    s = series.dropna().astype(float)
+@st.cache_data(ttl=60 * 60)
+def load_income_statement_quarterly():
+    """
+    Load quarterly income statement table from StockAnalysis financials page.
+    Returns tidy: date, metric, value
+    """
+    tables = fetch_tables(FINANCIALS_URL)
+
+    # Look for a table that has a first column like "Revenue" "Net Income" etc
+    best = None
+    for t in tables:
+        # Income statements often have first column "Item" or something,
+        # and then quarter columns.
+        if t.shape[0] >= 10 and t.shape[1] >= 4:
+            # try if it has common metrics in first column
+            first_col = t.columns[0]
+            values = t[first_col].astype(str).str.lower().tolist()
+            if any("revenue" in v for v in values) and any("net income" in v for v in values):
+                best = t
+                break
+
+    if best is None:
+        raise ValueError("Could not find an income statement table on the financials page.")
+
+    # Convert wide to long, but here rows are metrics and columns are dates.
+    df = best.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    metric_col = df.columns[0]
+
+    # Identify date columns
+    date_cols = []
+    for c in df.columns[1:]:
+        if standardize_quarter_date(c) is not None:
+            date_cols.append(c)
+
+    if not date_cols:
+        raise ValueError("Income statement table found but no quarterly date columns were detected.")
+
+    long = df.melt(id_vars=[metric_col], value_vars=date_cols, var_name="date", value_name="value")
+    long.rename(columns={metric_col: "metric"}, inplace=True)
+    long["date"] = pd.to_datetime(long["date"])
+    long["value"] = long["value"].apply(parse_money_to_float)
+    long = long.dropna(subset=["value"])
+    long = long.sort_values(["metric", "date"]).reset_index(drop=True)
+    return long
+
+
+def make_forecast(series_q, years=5, extra_cagr=0.0):
+    """
+    series_q: pd.Series indexed by date (quarter end), values in dollars
+    Forecast uses CAGR from last 8 quarters (2 years) if possible.
+    Creates quarterly forecast (years*4) with an 80% band from growth volatility.
+    """
+    s = series_q.dropna().copy()
     if len(s) < 6:
-        return 0.02, 0.05
+        # too short, fallback to flat growth
+        base_cagr = 0.02
+    else:
+        # Use last 8 quarters to estimate CAGR
+        tail = s.iloc[-8:] if len(s) >= 8 else s
+        start = tail.iloc[0]
+        end = tail.iloc[-1]
+        n_years = max((len(tail) - 1) / 4.0, 0.25)
+        if start <= 0 or end <= 0:
+            base_cagr = 0.02
+        else:
+            base_cagr = (end / start) ** (1 / n_years) - 1
 
-    s = s.iloc[-lookback_quarters:] if len(s) > lookback_quarters else s
-    g = s.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-    if len(g) < 3:
-        return 0.02, 0.05
+    scn_cagr = base_cagr + extra_cagr
 
-    return float(g.mean()), float(g.std(ddof=1) if len(g) > 1 else 0.05)
+    # quarterly growth rate
+    qg = (1 + scn_cagr) ** (1/4.0) - 1
 
+    # volatility from historical QoQ growth
+    if len(s) >= 6:
+        g = s.pct_change().dropna()
+        vol = float(np.nanstd(g))
+    else:
+        vol = 0.05
 
-def forecast_quarterly(hist_df: pd.DataFrame, years: int, uplift: float, lookback_quarters: int = 8) -> pd.DataFrame:
-    """
-    Forecast quarterly values forward.
-    uplift is extra ANNUAL CAGR (converted to quarterly).
-    """
-    df = hist_df.sort_values("date").dropna(subset=["revenue"]).copy()
-    last_date = df["date"].max()
-    last_val = float(df.loc[df["date"] == last_date, "revenue"].iloc[-1])
+    last_date = s.index[-1]
+    last_val = float(s.iloc[-1])
 
-    mean_q, std_q = estimate_qoq_growth(df["revenue"], lookback_quarters=lookback_quarters)
+    periods = int(years * 4)
+    future_dates = pd.date_range(last_date, periods=periods+1, freq="Q")[1:]
 
-    uplift_q = (1.0 + uplift) ** (1.0 / 4.0) - 1.0
-    q_growth = mean_q + uplift_q
+    fc_vals = []
+    hi_vals = []
+    lo_vals = []
 
-    steps = years * 4
-    future_dates = pd.date_range(last_date + pd.offsets.QuarterEnd(1), periods=steps, freq="Q")
-
-    fc, hi, lo = [], [], []
     cur = last_val
-    for i in range(1, steps + 1):
-        cur = cur * (1.0 + q_growth)
-        fc.append(cur)
+    for i in range(periods):
+        cur = cur * (1 + qg)
+        fc_vals.append(cur)
 
-        band = (std_q if std_q > 0 else 0.05) * np.sqrt(i)
-        hi.append(cur * (1.0 + band))
-        lo.append(cur * (1.0 - band))
+        # 80% band approx: +/- 1.28 * vol
+        band = 1.28 * vol
+        hi_vals.append(cur * (1 + band))
+        lo_vals.append(cur * (1 - band))
 
-    return pd.DataFrame({"date": future_dates, "forecast": fc, "hi": hi, "lo": lo})
+    fc = pd.DataFrame({
+        "date": future_dates,
+        "forecast": fc_vals,
+        "hi": hi_vals,
+        "lo": lo_vals
+    })
+    return base_cagr, scn_cagr, fc
 
 
-def money_fmt(x: float) -> str:
+def money_fmt(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return "—"
-    absx = abs(x)
+    x = float(x)
     sign = "-" if x < 0 else ""
-    if absx >= 1e12:
-        return f"{sign}${absx/1e12:,.2f}T"
-    if absx >= 1e9:
-        return f"{sign}${absx/1e9:,.2f}B"
-    if absx >= 1e6:
-        return f"{sign}${absx/1e6:,.2f}M"
-    return f"{sign}${absx:,.0f}"
+    x = abs(x)
+    if x >= 1e12:
+        return f"{sign}${x/1e12:,.2f}T"
+    if x >= 1e9:
+        return f"{sign}${x/1e9:,.2f}B"
+    if x >= 1e6:
+        return f"{sign}${x/1e6:,.2f}M"
+    return f"{sign}${x:,.0f}"
 
 
-def build_plot(hist: pd.DataFrame, fc: pd.DataFrame, title: str, y_label: str) -> go.Figure:
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter(x=hist["date"], y=hist["revenue"], mode="lines", name="Historical"))
-
-    fig.add_trace(go.Scatter(x=fc["date"], y=fc["hi"], mode="lines", name="80% high (approx)", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=fc["date"], y=fc["lo"], mode="lines", name="80% low (approx)", line=dict(dash="dot")))
-
-    fig.add_trace(go.Scatter(x=fc["date"], y=fc["forecast"], mode="lines", name="Forecast (Scenario)"))
-
-    fig.update_layout(
-        title=title,
-        height=520,
-        xaxis_title="Quarter",
-        yaxis_title=y_label,
-        hovermode="x unified",
-        margin=dict(l=20, r=20, t=60, b=20),
-    )
-    return fig
-
-
-# -----------------------------
-# LOAD + BUILD DATASETS
-# -----------------------------
-wide_ttm = load_revenue_by_segment_wide()
-wide_q = convert_wide_ttm_to_quarterly(wide_ttm)
-
-# Build tidy views for UI
-tidy_ttm = wide_ttm.melt("date", var_name="product", value_name="revenue").dropna()
-tidy_q = wide_q.melt("date", var_name="product", value_name="revenue").dropna()
-
-products = sorted(tidy_q["product"].unique().tolist())
-default_product = "Advertising" if "Advertising" in products else products[0]
-
-# -----------------------------
-# UI
-# -----------------------------
-st.sidebar.title("Controls")
-
-product = st.sidebar.selectbox("Product", products, index=products.index(default_product))
-years = st.sidebar.slider("Forecast years", min_value=1, max_value=10, value=3, step=1)
-uplift = st.sidebar.slider("Extra CAGR uplift (scenario)", min_value=0.00, max_value=0.30, value=0.00, step=0.01)
-view_mode = st.sidebar.radio("View mode", ["Quarterly (converted)", "TTM (raw)"], index=0)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("TTM → Quarterly uses Qₜ = TTMₜ − TTMₜ₋₁ + Qₜ₋₄ with first 4 quarters seeded as TTM/4.")
-
-# Header
+# =========================
+# UI HEADER
+# =========================
 col1, col2 = st.columns([1, 12])
 with col1:
     st.image(
         "https://www.google.com/images/branding/googlelogo/2x/googlelogo_color_272x92dp.png",
-        use_container_width=True,
+        width=90
     )
 with col2:
     st.markdown(
         """
         # Alphabet (Google) Revenue Forecast Dashboard
-        Interactive segment forecasting with scenario-based CAGR uplift. Data source is a TTM table; quarterly values are reconstructed for modeling.
+        Interactive product-level **quarterly** revenue analysis and scenario forecasting.
         """
     )
 
-st.markdown("---")
+st.caption(
+    "Data source: StockAnalysis (segment revenue + income statement). "
+    "If the site blocks scraping, the app may need a redeploy or cached dataset."
+)
 
-tab1, tab2, tab3, tab4 = st.tabs(["Product Forecast", "Total Forecast", "Assumptions & Notes", "Download"])
+# =========================
+# LOAD DATA
+# =========================
+with st.spinner("Loading segment revenue data..."):
+    seg_long = load_segment_quarterly()
 
-# Choose which series to show in chart table
-tidy_show = tidy_q if view_mode.startswith("Quarterly") else tidy_ttm
-y_label = "Revenue (USD) — Quarterly" if view_mode.startswith("Quarterly") else "Revenue (USD) — TTM"
+with st.spinner("Loading income statement data..."):
+    inc_long = load_income_statement_quarterly()
 
-# -----------------------------
-# TAB 1: Product Forecast (FORECAST ALWAYS USES QUARTERLY)
-# -----------------------------
+# Pivot segment quarterly for easier use
+seg_piv = seg_long.pivot_table(index="date", columns="segment", values="value", aggfunc="sum").sort_index()
+
+# Total revenue (sum of segments)
+seg_piv["TOTAL (Sum of Segments)"] = seg_piv.sum(axis=1)
+
+# Income statement pivot
+inc_piv = inc_long.pivot_table(index="date", columns="metric", values="value", aggfunc="sum").sort_index()
+
+
+# =========================
+# SIDEBAR CONTROLS
+# =========================
+st.sidebar.header("Controls")
+
+segments = [c for c in seg_piv.columns if c != "TOTAL (Sum of Segments)"]
+default_seg = "Advertising" if "Advertising" in segments else segments[0]
+
+product = st.sidebar.selectbox("Product / Segment", segments, index=segments.index(default_seg))
+years = st.sidebar.slider("Forecast years", min_value=1, max_value=10, value=5, step=1)
+uplift = st.sidebar.slider("Extra CAGR uplift (scenario)", min_value=0.0, max_value=0.10, value=0.00, step=0.005)
+
+st.sidebar.divider()
+st.sidebar.subheader("Notes")
+st.sidebar.write(
+    "- This app uses **quarterly values**.\n"
+    "- If the webpage served **TTM**, we convert using:\n"
+    "  **Quarter(t) = TTM(t) − TTM(t−1)**\n"
+    "- Negative values (ex: hedging) are preserved."
+)
+
+# =========================
+# TABS
+# =========================
+tab1, tab2, tab3, tab4 = st.tabs(["Segment (Quarterly)", "Product Forecast", "Income Statement", "Download"])
+
+# -------------------------
+# TAB 1: STACKED SEGMENTS
+# -------------------------
 with tab1:
-    # Display series based on view_mode
-    show_seg = tidy_show[tidy_show["product"] == product].sort_values("date")
+    st.subheader("Segment Revenue (Quarterly)")
 
-    # Forecast uses quarterly reconstructed
-    seg_q = tidy_q[tidy_q["product"] == product].sort_values("date")
-    fc = forecast_quarterly(seg_q[["date", "revenue"]], years=years, uplift=uplift)
+    # build stacked bar like your screenshot
+    df_stack = seg_piv.drop(columns=["TOTAL (Sum of Segments)"]).copy()
+    df_stack = df_stack.dropna(how="all")
+    df_stack = df_stack.tail(16)  # last 16 quarters
 
-    end_fc = float(fc["forecast"].iloc[-1])
-    base_end = float(forecast_quarterly(seg_q[["date", "revenue"]], years=years, uplift=0.0)["forecast"].iloc[-1])
-    delta = end_fc - base_end
+    fig = go.Figure()
+    for seg in df_stack.columns:
+        fig.add_trace(go.Bar(
+            x=df_stack.index,
+            y=df_stack[seg],
+            name=seg
+        ))
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("End Forecast (Scenario)", money_fmt(end_fc))
-    k2.metric("Δ vs Baseline", money_fmt(delta))
-    k3.metric("Last Reported Quarter", show_seg["date"].max().strftime("%b %d, %Y"))
-
-    fig = build_plot(
-        show_seg[["date", "revenue"]],
-        fc,
-        title=f"{product}: Historical + {years}-Year Forecast (uplift {uplift*100:.1f}%)",
-        y_label=y_label,
+    fig.update_layout(
+        barmode="stack",
+        height=550,
+        xaxis_title="Quarter",
+        yaxis_title="Revenue (USD)",
+        legend_title="Segments",
+        margin=dict(l=20, r=20, t=50, b=20),
     )
+
     st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------
-# TAB 2: Total Forecast (sum of segment forecasts, quarterly)
-# -----------------------------
+    st.caption("Tip: Hover a quarter to see each segment’s revenue. This uses **true quarterly values**.")
+
+# -------------------------
+# TAB 2: PRODUCT FORECAST
+# -------------------------
 with tab2:
-    # Quarterly wide for totals
-    wide_q2 = wide_q.set_index("date").sort_index().dropna(how="all")
+    st.subheader(f"{product}: Historical + Forecast")
 
-    # total historical (quarterly)
-    total_hist = wide_q2.sum(axis=1).reset_index()
-    total_hist.columns = ["date", "revenue"]
+    s = seg_piv[product].dropna()
+    base_cagr, scn_cagr, fc = make_forecast(s, years=years, extra_cagr=uplift)
 
-    # forecast each segment quarterly and sum forecasts
-    future_steps = years * 4
-    last_date = wide_q2.index.max()
-    future_dates = pd.date_range(last_date + pd.offsets.QuarterEnd(1), periods=future_steps, freq="Q")
+    # KPIs
+    end_fc = fc["forecast"].iloc[-1] if len(fc) else np.nan
+    last_hist = s.iloc[-1] if len(s) else np.nan
 
-    total_fc_vals = np.zeros(future_steps, dtype=float)
-    total_hi_vals = np.zeros(future_steps, dtype=float)
-    total_lo_vals = np.zeros(future_steps, dtype=float)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Last Quarter", money_fmt(last_hist))
+    k2.metric("End Forecast", money_fmt(end_fc))
+    k3.metric("Baseline CAGR", f"{base_cagr*100:.2f}%")
+    k4.metric("Scenario CAGR", f"{scn_cagr*100:.2f}%")
 
-    for c in wide_q2.columns:
-        hist_c = wide_q2[[c]].reset_index().rename(columns={c: "revenue"})
-        fcc = forecast_quarterly(hist_c[["date", "revenue"]], years=years, uplift=uplift)
-        total_fc_vals += fcc["forecast"].values
-        total_hi_vals += fcc["hi"].values
-        total_lo_vals += fcc["lo"].values
+    # Plotly line + band
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name="Historical"))
+    fig2.add_trace(go.Scatter(x=fc["date"], y=fc["forecast"], mode="lines", name="Forecast (Scenario)"))
+    fig2.add_trace(go.Scatter(x=fc["date"], y=fc["hi"], mode="lines", name="80% High", line=dict(dash="dot")))
+    fig2.add_trace(go.Scatter(x=fc["date"], y=fc["lo"], mode="lines", name="80% Low", line=dict(dash="dot")))
 
-    total_fc = pd.DataFrame({"date": future_dates, "forecast": total_fc_vals, "hi": total_hi_vals, "lo": total_lo_vals})
-
-    fig_total = build_plot(
-        total_hist[["date", "revenue"]],
-        total_fc,
-        title="Total Alphabet Revenue Forecast (Scenario) — Quarterly (sum of segments)",
-        y_label="Revenue (USD) — Quarterly",
+    fig2.update_layout(
+        height=520,
+        xaxis_title="Quarter",
+        yaxis_title="Revenue (USD)",
+        margin=dict(l=20, r=20, t=40, b=20),
     )
-    st.plotly_chart(fig_total, use_container_width=True)
-    st.caption("Total forecast = sum of per-segment quarterly forecasts (not a separately fit total model).")
+    st.plotly_chart(fig2, use_container_width=True)
 
-# -----------------------------
-# TAB 3: Assumptions
-# -----------------------------
+    st.info(
+        "Forecast method: baseline CAGR estimated from recent quarters, scenario adds uplift. "
+        "Band is based on historical QoQ growth volatility (approx 80%)."
+    )
+
+# -------------------------
+# TAB 3: INCOME STATEMENT
+# -------------------------
 with tab3:
-    st.subheader("TTM → Quarterly conversion")
-    st.write(
-        """
-        The source table is TTM (trailing-twelve-month) revenue at each quarter-end.
+    st.subheader("Income Statement (Quarterly)")
 
-        We reconstruct quarterly revenue per segment using:
-        **Qₜ = TTMₜ − TTMₜ₋₁ + Qₜ₋₄**
+    metrics = list(inc_piv.columns)
+    default_metric = "Revenue" if "Revenue" in metrics else metrics[0]
+    metric = st.selectbox("Metric", metrics, index=metrics.index(default_metric))
 
-        The first 4 quarters are seeded as **TTM/4** (a standard seeding approach).
-        """
+    s2 = inc_piv[metric].dropna()
+
+    fig3 = go.Figure()
+    fig3.add_trace(go.Scatter(x=s2.index, y=s2.values, mode="lines+markers", name=metric))
+    fig3.update_layout(
+        height=520,
+        xaxis_title="Quarter",
+        yaxis_title=f"{metric} (USD)",
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+
+    st.dataframe(
+        s2.reset_index().rename(columns={"index": "date", metric: "value"}),
+        use_container_width=True
     )
 
-    st.subheader("Forecast method")
-    st.write(
-        """
-        Forecasting is done on the reconstructed quarterly series:
-        - Compute recent QoQ growth over a lookback window
-        - Apply your extra annual CAGR uplift (converted to quarterly)
-        - Add a widening uncertainty band based on recent growth volatility
-        """
-    )
-
-# -----------------------------
-# TAB 4: Download
-# -----------------------------
+# -------------------------
+# TAB 4: DOWNLOAD
+# -------------------------
 with tab4:
-    st.subheader("Download data")
+    st.subheader("Download Data")
 
-    st.download_button(
-        "Download RAW TTM (wide) as CSV",
-        data=wide_ttm.to_csv(index=False).encode("utf-8"),
-        file_name="goog_revenue_by_segment_ttm_wide.csv",
-        mime="text/csv",
-    )
+    seg_csv = seg_long.copy()
+    seg_csv["value"] = seg_csv["value"].astype(float)
+    seg_csv_out = seg_csv.to_csv(index=False).encode("utf-8")
 
-    st.download_button(
-        "Download QUARTERLY (reconstructed wide) as CSV",
-        data=wide_q.to_csv(index=False).encode("utf-8"),
-        file_name="goog_revenue_by_segment_quarterly_wide.csv",
-        mime="text/csv",
-    )
+    inc_csv = inc_long.copy()
+    inc_csv["value"] = inc_csv["value"].astype(float)
+    inc_csv_out = inc_csv.to_csv(index=False).encode("utf-8")
 
-    st.download_button(
-        "Download QUARTERLY (reconstructed tidy) as CSV",
-        data=tidy_q.to_csv(index=False).encode("utf-8"),
-        file_name="goog_revenue_by_segment_quarterly_tidy.csv",
-        mime="text/csv",
-    )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Download Segment Revenue (Quarterly) CSV",
+            data=seg_csv_out,
+            file_name="alphabet_segment_revenue_quarterly.csv",
+            mime="text/csv"
+        )
+    with c2:
+        st.download_button(
+            "Download Income Statement (Quarterly) CSV",
+            data=inc_csv_out,
+            file_name="alphabet_income_statement_quarterly.csv",
+            mime="text/csv"
+        )
 
-    st.caption("Source: StockAnalysis → GOOG → Metrics → Revenue by Segment (History table)")
+    st.caption("If you deploy this on Streamlit Community Cloud, share the app URL and people can interact with it live.")
