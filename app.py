@@ -318,81 +318,10 @@ def forecast_series(hist_df: pd.DataFrame, years: int, uplift_annual: float, loo
 
 
 # =============================
-# YAHOO INCOME STATEMENT SCRAPE (FIXED JSON PARSE + FIXED DATES)
+# YAHOO INCOME STATEMENT SCRAPE (CLOUD-SAFE: Yahoo -> fallback to StockAnalysis)
 # =============================
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def load_yahoo_income_quarterly() -> pd.DataFrame:
-    def extract_root_app_main_json(html: str) -> dict:
-        marker = "root.App.main ="
-        i = html.find(marker)
-        if i == -1:
-            raise ValueError("Could not find 'root.App.main =' in Yahoo HTML.")
-
-        j = html.find("{", i)
-        if j == -1:
-            raise ValueError("Could not find opening '{' for Yahoo embedded JSON.")
-
-        depth = 0
-        in_str = False
-        esc = False
-        for k in range(j, len(html)):
-            ch = html[k]
-
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-            else:
-                if ch == '"':
-                    in_str = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        json_text = html[j:k+1]
-                        return json.loads(json_text)
-
-        raise ValueError("Failed to extract Yahoo embedded JSON by brace-matching.")
-
-    r = requests.get(YAHOO_FIN_URL, headers=UA_HEADERS, timeout=30)
-    r.raise_for_status()
-    html = r.text
-
-    data = extract_root_app_main_json(html)
-
-    stores = data.get("context", {}).get("dispatcher", {}).get("stores", {})
-    qss = stores.get("QuoteSummaryStore", {})
-
-    inc_q = qss.get("incomeStatementHistoryQuarterly", {}).get("incomeStatementHistory", [])
-    if not inc_q:
-        raise ValueError("Yahoo quarterly income statement data not found (incomeStatementHistoryQuarterly empty).")
-
-    rows = []
-    for entry in inc_q:
-        end = entry.get("endDate", {}).get("raw", None)
-        if end is None:
-            continue
-
-        dt = pd.to_datetime(int(end), unit="s", errors="coerce")
-        dt = snap_to_quarter_end(dt)
-
-        for k, v in entry.items():
-            if k in ["maxAge", "endDate"]:
-                continue
-            if isinstance(v, dict) and "raw" in v:
-                val = v.get("raw", None)
-                if val is None:
-                    continue
-                rows.append({"date": dt, "metric": k, "value": float(val)})
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        raise ValueError("Yahoo income statement parsed but produced no rows.")
-
     pretty = {
         "totalRevenue": "Total Revenue",
         "costOfRevenue": "Cost of Revenue",
@@ -409,9 +338,148 @@ def load_yahoo_income_quarterly() -> pd.DataFrame:
         "ebit": "EBIT",
         "ebitda": "EBITDA",
     }
-    df["metric"] = df["metric"].map(lambda x: pretty.get(x, x))
-    df = df.sort_values(["metric", "date"]).reset_index(drop=True)
-    return df
+
+    # 1) TRY YAHOO
+    try:
+        def extract_root_app_main_json(html: str) -> dict:
+            marker = "root.App.main ="
+            i = html.find(marker)
+            if i == -1:
+                raise ValueError("Could not find 'root.App.main =' in Yahoo HTML.")
+
+            j = html.find("{", i)
+            if j == -1:
+                raise ValueError("Could not find opening '{' for Yahoo embedded JSON.")
+
+            depth = 0
+            in_str = False
+            esc = False
+            for k in range(j, len(html)):
+                ch = html[k]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                else:
+                    if ch == '"':
+                        in_str = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            json_text = html[j:k+1]
+                            return json.loads(json_text)
+
+            raise ValueError("Failed to extract Yahoo embedded JSON by brace-matching.")
+
+        r = requests.get(YAHOO_FIN_URL, headers=UA_HEADERS, timeout=30)
+        r.raise_for_status()
+        html = r.text
+
+        data = extract_root_app_main_json(html)
+        stores = data.get("context", {}).get("dispatcher", {}).get("stores", {})
+        qss = stores.get("QuoteSummaryStore", {})
+
+        inc_q = qss.get("incomeStatementHistoryQuarterly", {}).get("incomeStatementHistory", [])
+        if not inc_q:
+            raise ValueError("Yahoo quarterly income statement data not found (empty store).")
+
+        rows = []
+        for entry in inc_q:
+            end = entry.get("endDate", {}).get("raw", None)
+            if end is None:
+                continue
+
+            dt = pd.to_datetime(int(end), unit="s", errors="coerce")
+            dt = snap_to_quarter_end(dt)
+
+            for k, v in entry.items():
+                if k in ["maxAge", "endDate"]:
+                    continue
+                if isinstance(v, dict) and "raw" in v:
+                    val = v.get("raw", None)
+                    if val is None:
+                        continue
+                    rows.append({"date": dt, "metric": pretty.get(k, k), "value": float(val)})
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            raise ValueError("Yahoo income statement parsed but produced no rows.")
+
+        return df.sort_values(["metric", "date"]).reset_index(drop=True)
+
+    except Exception:
+        # 2) FALLBACK: STOCKANALYSIS QUARTERLY FINANCIALS
+        STOCKANALYSIS_FIN_Q = "https://stockanalysis.com/stocks/goog/financials/?p=quarterly"
+        r2 = requests.get(STOCKANALYSIS_FIN_Q, headers=UA_HEADERS, timeout=30)
+        r2.raise_for_status()
+
+        tables = pd.read_html(r2.text)
+        if not tables:
+            raise ValueError("No tables found on StockAnalysis financials page.")
+
+        t = tables[0].copy()
+        first_col = t.columns[0]
+        t = t.rename(columns={first_col: "Metric"}).copy()
+
+        date_cols = [c for c in t.columns if c != "Metric"]
+        if not date_cols:
+            raise ValueError("StockAnalysis income statement table has no date columns.")
+
+        row_map = {
+            "Revenue": "Total Revenue",
+            "Cost of Revenue": "Cost of Revenue",
+            "Gross Profit": "Gross Profit",
+            "Research & Development": "Research & Development",
+            "Selling, General & Admin": "Selling, General & Admin",
+            "Operating Expenses": "Operating Expenses",
+            "Operating Income": "Operating Income",
+            "Pretax Income": "EBT (Income Before Tax)",
+            "Income Tax": "Income Tax Expense",
+            "Net Income": "Net Income",
+            "EBITDA": "EBITDA",
+            "EBIT": "EBIT",
+        }
+
+        out_rows = []
+        for _, row in t.iterrows():
+            raw_name = str(row["Metric"]).strip()
+            if raw_name not in row_map:
+                continue
+            nice_name = row_map[raw_name]
+
+            for dc in date_cols:
+                date_str = str(dc).strip()
+                dt = pd.to_datetime(date_str, errors="coerce")
+
+                if pd.isna(dt):
+                    try:
+                        dt = pd.to_datetime(date_str.replace("'", ""), format="%b %y", errors="coerce")
+                    except Exception:
+                        dt = pd.NaT
+
+                if pd.isna(dt):
+                    continue
+
+                dt = snap_to_quarter_end(dt)
+
+                val = money_to_float(row.get(dc, None))
+                if np.isnan(val):
+                    continue
+
+                # StockAnalysis financials are typically in millions
+                val = float(val) * 1e6
+                out_rows.append({"date": dt, "metric": nice_name, "value": val})
+
+        df2 = pd.DataFrame(out_rows)
+        if df2.empty:
+            raise ValueError("StockAnalysis fallback produced no mapped income statement rows.")
+
+        return df2.sort_values(["metric", "date"]).reset_index(drop=True)
 
 
 # =============================
@@ -459,6 +527,9 @@ view_mode = st.sidebar.radio(
 # =============================
 seg_q = load_revenue_by_segment_quarterly()
 seg_active = seg_q if view_mode == "Quarterly" else compute_ttm_from_quarterly(seg_q)
+
+# ✅ IMPORTANT FIX: load income statement ONCE so it's defined for Income Statement tab AND Download tab
+inc = load_yahoo_income_quarterly()
 
 products = sorted(seg_active["product"].unique().tolist())
 default_product = "Advertising" if "Advertising" in products else products[0]
@@ -554,195 +625,21 @@ with tab3:
     st.dataframe(chk[["product", "revenue_fmt"]], use_container_width=True)
 
 
-# TAB 4 (INCOME STATEMENT FIXED)
-# =============================
-# YAHOO INCOME STATEMENT SCRAPE (CLOUD-SAFE: Yahoo -> fallback to StockAnalysis)
-# =============================
-@st.cache_data(ttl=60 * 60, show_spinner=False)
-def load_yahoo_income_quarterly() -> pd.DataFrame:
-    """
-    Streamlit Cloud often gets blocked by Yahoo Finance (403/429).
-    This function:
-      1) Tries Yahoo first (same data you wanted)
-      2) If Yahoo fails, falls back to StockAnalysis quarterly income statement table.
-    Output schema stays the same: columns = [date, metric, value]
-    """
+# TAB 4 (INCOME STATEMENT)
+with tab4:
+    st.subheader("Income Statement (Yahoo Finance: GOOGL)")
 
-    # ---------- helper: pretty metric names ----------
-    pretty = {
-        "totalRevenue": "Total Revenue",
-        "costOfRevenue": "Cost of Revenue",
-        "grossProfit": "Gross Profit",
-        "researchDevelopment": "Research & Development",
-        "sellingGeneralAdministrative": "Selling, General & Admin",
-        "totalOperatingExpenses": "Operating Expenses",
-        "operatingIncome": "Operating Income",
-        "interestExpense": "Interest Expense",
-        "interestIncome": "Interest & Investment Income",
-        "incomeBeforeTax": "EBT (Income Before Tax)",
-        "incomeTaxExpense": "Income Tax Expense",
-        "netIncome": "Net Income",
-        "ebit": "EBIT",
-        "ebitda": "EBITDA",
-    }
+    metric_list = sorted(inc["metric"].unique().tolist())
+    default_metric = "Total Revenue" if "Total Revenue" in metric_list else metric_list[0]
+    metric = st.selectbox("Metric", metric_list, index=metric_list.index(default_metric))
 
-    # ---------- 1) TRY YAHOO ----------
-    try:
-        def extract_root_app_main_json(html: str) -> dict:
-            marker = "root.App.main ="
-            i = html.find(marker)
-            if i == -1:
-                raise ValueError("Could not find 'root.App.main =' in Yahoo HTML.")
+    fig_inc = build_bar_income(inc, metric)
+    st.plotly_chart(fig_inc, use_container_width=True)
 
-            j = html.find("{", i)
-            if j == -1:
-                raise ValueError("Could not find opening '{' for Yahoo embedded JSON.")
-
-            depth = 0
-            in_str = False
-            esc = False
-            for k in range(j, len(html)):
-                ch = html[k]
-                if in_str:
-                    if esc:
-                        esc = False
-                    elif ch == "\\":
-                        esc = True
-                    elif ch == '"':
-                        in_str = False
-                else:
-                    if ch == '"':
-                        in_str = True
-                    elif ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0:
-                            json_text = html[j:k+1]
-                            return json.loads(json_text)
-
-            raise ValueError("Failed to extract Yahoo embedded JSON by brace-matching.")
-
-        r = requests.get(YAHOO_FIN_URL, headers=UA_HEADERS, timeout=30)
-        r.raise_for_status()
-        html = r.text
-
-        data = extract_root_app_main_json(html)
-        stores = data.get("context", {}).get("dispatcher", {}).get("stores", {})
-        qss = stores.get("QuoteSummaryStore", {})
-
-        inc_q = qss.get("incomeStatementHistoryQuarterly", {}).get("incomeStatementHistory", [])
-        if not inc_q:
-            raise ValueError("Yahoo quarterly income statement data not found (empty store).")
-
-        rows = []
-        for entry in inc_q:
-            end = entry.get("endDate", {}).get("raw", None)
-            if end is None:
-                continue
-
-            dt = pd.to_datetime(int(end), unit="s", errors="coerce")
-            dt = snap_to_quarter_end(dt)
-
-            for k, v in entry.items():
-                if k in ["maxAge", "endDate"]:
-                    continue
-                if isinstance(v, dict) and "raw" in v:
-                    val = v.get("raw", None)
-                    if val is None:
-                        continue
-                    rows.append({"date": dt, "metric": pretty.get(k, k), "value": float(val)})
-
-        df = pd.DataFrame(rows)
-        if df.empty:
-            raise ValueError("Yahoo income statement parsed but produced no rows.")
-
-        return df.sort_values(["metric", "date"]).reset_index(drop=True)
-
-    except Exception:
-        # ---------- 2) FALLBACK: STOCKANALYSIS QUARTERLY FINANCIALS ----------
-        # This is what makes it work on Streamlit Cloud.
-        STOCKANALYSIS_FIN_Q = "https://stockanalysis.com/stocks/goog/financials/?p=quarterly"
-
-        r2 = requests.get(STOCKANALYSIS_FIN_Q, headers=UA_HEADERS, timeout=30)
-        r2.raise_for_status()
-
-        # Use pandas read_html for stable parsing
-        tables = pd.read_html(r2.text)
-        if not tables:
-            raise ValueError("No tables found on StockAnalysis financials page.")
-
-        # Income statement is typically the first table
-        t = tables[0].copy()
-
-        # First column is the row label (metric name)
-        first_col = t.columns[0]
-        t = t.rename(columns={first_col: "Metric"}).copy()
-
-        # Columns after Metric are dates like "Sep 2025", "Jun 2025", etc.
-        date_cols = [c for c in t.columns if c != "Metric"]
-        if not date_cols:
-            raise ValueError("StockAnalysis income statement table has no date columns.")
-
-        # Map StockAnalysis row names -> your app metric names
-        # (We keep your labels so the dropdown looks clean)
-        row_map = {
-            "Revenue": "Total Revenue",
-            "Cost of Revenue": "Cost of Revenue",
-            "Gross Profit": "Gross Profit",
-            "Research & Development": "Research & Development",
-            "Selling, General & Admin": "Selling, General & Admin",
-            "Operating Expenses": "Operating Expenses",
-            "Operating Income": "Operating Income",
-            "Pretax Income": "EBT (Income Before Tax)",
-            "Income Tax": "Income Tax Expense",
-            "Net Income": "Net Income",
-            "EBITDA": "EBITDA",
-            "EBIT": "EBIT",
-        }
-
-        # Build tidy output
-        out_rows = []
-        for _, row in t.iterrows():
-            raw_name = str(row["Metric"]).strip()
-            if raw_name not in row_map:
-                continue
-            nice_name = row_map[raw_name]
-
-            for dc in date_cols:
-                date_str = str(dc).strip()
-                # Parse "Sep 2025" -> quarter end
-                dt = pd.to_datetime(date_str, errors="coerce")
-                if pd.isna(dt):
-                    # Sometimes headers are like "Sep '25"
-                    try:
-                        dt = pd.to_datetime(date_str.replace("'", ""), format="%b %y", errors="coerce")
-                    except Exception:
-                        dt = pd.NaT
-                if pd.isna(dt):
-                    continue
-
-                dt = snap_to_quarter_end(dt)
-
-                v = row.get(dc, None)
-                val = money_to_float(v)
-
-                # StockAnalysis financials are usually shown in millions for big companies
-                # Example: 102,354 -> $102.354B
-                if not np.isnan(val):
-                    val = float(val) * 1e6
-
-                if np.isnan(val):
-                    continue
-
-                out_rows.append({"date": dt, "metric": nice_name, "value": float(val)})
-
-        df2 = pd.DataFrame(out_rows)
-        if df2.empty:
-            raise ValueError("StockAnalysis fallback worked but no mapped income statement rows were found.")
-
-        return df2.sort_values(["metric", "date"]).reset_index(drop=True)
-
+    mdf = inc[inc["metric"] == metric].sort_values("date", ascending=False).copy()
+    mdf["Period Ending"] = pd.to_datetime(mdf["date"]).dt.strftime("%b %d, %Y")
+    mdf["Value"] = mdf["value"].apply(money_fmt)
+    st.dataframe(mdf[["Period Ending", "Value"]], use_container_width=True)
 
 
 # TAB 5
@@ -775,4 +672,3 @@ with tab5:
         file_name="yahoo_income_statement_quarterly.csv",
         mime="text/csv",
     )
-
