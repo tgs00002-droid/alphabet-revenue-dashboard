@@ -318,26 +318,58 @@ def forecast_series(hist_df: pd.DataFrame, years: int, uplift_annual: float, loo
 
 
 # =============================
-# YAHOO INCOME STATEMENT SCRAPE (FIXED DATES)
+# YAHOO INCOME STATEMENT SCRAPE (FIXED JSON PARSE + FIXED DATES)
 # =============================
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def load_yahoo_income_quarterly() -> pd.DataFrame:
+    def extract_root_app_main_json(html: str) -> dict:
+        marker = "root.App.main ="
+        i = html.find(marker)
+        if i == -1:
+            raise ValueError("Could not find 'root.App.main =' in Yahoo HTML.")
+
+        j = html.find("{", i)
+        if j == -1:
+            raise ValueError("Could not find opening '{' for Yahoo embedded JSON.")
+
+        depth = 0
+        in_str = False
+        esc = False
+        for k in range(j, len(html)):
+            ch = html[k]
+
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        json_text = html[j:k+1]
+                        return json.loads(json_text)
+
+        raise ValueError("Failed to extract Yahoo embedded JSON by brace-matching.")
+
     r = requests.get(YAHOO_FIN_URL, headers=UA_HEADERS, timeout=30)
     r.raise_for_status()
     html = r.text
 
-    m = re.search(r"root\.App\.main\s*=\s*(\{.*?\});\s*\n", html, flags=re.DOTALL)
-    if not m:
-        raise ValueError("Could not find Yahoo embedded JSON (root.App.main).")
-
-    data = json.loads(m.group(1))
+    data = extract_root_app_main_json(html)
 
     stores = data.get("context", {}).get("dispatcher", {}).get("stores", {})
     qss = stores.get("QuoteSummaryStore", {})
 
     inc_q = qss.get("incomeStatementHistoryQuarterly", {}).get("incomeStatementHistory", [])
     if not inc_q:
-        raise ValueError("Yahoo quarterly income statement data not found.")
+        raise ValueError("Yahoo quarterly income statement data not found (incomeStatementHistoryQuarterly empty).")
 
     rows = []
     for entry in inc_q:
@@ -345,9 +377,7 @@ def load_yahoo_income_quarterly() -> pd.DataFrame:
         if end is None:
             continue
 
-        # Convert unix to timestamp (Yahoo uses seconds)
         dt = pd.to_datetime(int(end), unit="s", errors="coerce")
-        # KEY FIX: snap to true quarter-end (end of month, quarter-end)
         dt = snap_to_quarter_end(dt)
 
         for k, v in entry.items():
@@ -536,7 +566,6 @@ with tab4:
     fig_inc = build_bar_income(inc, metric)
     st.plotly_chart(fig_inc, use_container_width=True)
 
-    # Table view with proper period ending
     mdf = inc[inc["metric"] == metric].sort_values("date", ascending=False).copy()
     mdf["Period Ending"] = pd.to_datetime(mdf["date"]).dt.strftime("%b %d, %Y")
     mdf["Value"] = mdf["value"].apply(money_fmt)
@@ -573,3 +602,4 @@ with tab5:
         file_name="yahoo_income_statement_quarterly.csv",
         mime="text/csv",
     )
+
