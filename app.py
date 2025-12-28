@@ -16,6 +16,7 @@ import streamlit as st
 # CONFIG
 # =============================
 SEGMENT_URL = "https://stockanalysis.com/stocks/goog/metrics/revenue-by-segment/"
+FINANCIALS_URL = "https://stockanalysis.com/stocks/goog/financials/"
 
 # Rotate user agents to avoid blocking
 UA_HEADERS_LIST = [
@@ -246,6 +247,94 @@ def segment_sum_total_from_quarterly(seg_q: pd.DataFrame) -> pd.DataFrame:
     out = total.reset_index().rename(columns={0: "revenue"})
     out.columns = ["date", "revenue"]
     return out
+
+
+# =============================
+# STOCKANALYSIS FINANCIALS SCRAPE
+# =============================
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def load_total_revenue_from_financials() -> pd.DataFrame:
+    """Scrape total revenue from StockAnalysis financials page (quarterly)"""
+    for attempt, headers in enumerate(UA_HEADERS_LIST, 1):
+        try:
+            time.sleep(0.5)
+            r = requests.get(FINANCIALS_URL + "?p=quarterly", headers=headers, timeout=30)
+            r.raise_for_status()
+            
+            soup = BeautifulSoup(r.text, "lxml")
+            
+            # Find the main financial table
+            tables = soup.find_all("table")
+            if not tables:
+                raise ValueError("No tables found on financials page")
+            
+            table = tables[0]  # Main income statement table
+            
+            # Get headers
+            thead = table.find("thead")
+            if not thead:
+                raise ValueError("No table headers found")
+            
+            header_rows = thead.find_all("tr")
+            dates = []
+            for th in header_rows[0].find_all("th")[1:]:  # Skip first column (label)
+                date_text = th.get_text(strip=True)
+                # Parse dates like "Sep '25" or "Dec '24"
+                if date_text and date_text not in ["TTM", "FY 2024", "FY 2023"]:
+                    dates.append(date_text)
+            
+            # Get Revenue row
+            tbody = table.find("tbody")
+            if not tbody:
+                raise ValueError("No table body found")
+            
+            revenue_row = None
+            for row in tbody.find_all("tr"):
+                first_cell = row.find("td")
+                if first_cell and "revenue" in first_cell.get_text(strip=True).lower():
+                    # Make sure it's the main Revenue row, not "Revenue Growth"
+                    if first_cell.get_text(strip=True).lower() == "revenue":
+                        revenue_row = row
+                        break
+            
+            if not revenue_row:
+                raise ValueError("Revenue row not found in table")
+            
+            # Parse revenue values
+            values = []
+            for td in revenue_row.find_all("td")[1:len(dates)+1]:
+                val_text = td.get_text(strip=True).replace(",", "")
+                values.append(money_to_float(val_text))
+            
+            # Create dataframe
+            df_data = []
+            for i, date_str in enumerate(dates):
+                if i < len(values):
+                    # Parse date (e.g., "Sep '25" -> "2025-09-30")
+                    try:
+                        parts = date_str.replace("'", "").split()
+                        if len(parts) == 2:
+                            month_str, year_str = parts
+                            year = int("20" + year_str) if len(year_str) == 2 else int(year_str)
+                            date_obj = pd.to_datetime(f"{month_str} {year}", format="%b %Y")
+                            date_obj = snap_to_quarter_end(date_obj)
+                            df_data.append({"date": date_obj, "revenue": values[i] * 1e6})  # Convert millions to actual
+                    except:
+                        continue
+            
+            df = pd.DataFrame(df_data)
+            if df.empty or len(df) < 4:
+                raise ValueError("Insufficient quarterly data parsed")
+            
+            return df.sort_values("date").reset_index(drop=True)
+            
+        except Exception as e:
+            if attempt == len(UA_HEADERS_LIST):
+                st.warning(f"Could not load financials data: {str(e)}")
+                return pd.DataFrame(columns=["date", "revenue"])
+            continue
+    
+    return pd.DataFrame(columns=["date", "revenue"])
 
 
 # =============================
