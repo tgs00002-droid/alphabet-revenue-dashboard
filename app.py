@@ -16,7 +16,6 @@ import streamlit as st
 # CONFIG
 # =============================
 SEGMENT_URL = "https://stockanalysis.com/stocks/goog/metrics/revenue-by-segment/"
-YAHOO_FIN_URL = "https://finance.yahoo.com/quote/GOOGL/financials"
 
 # Rotate user agents to avoid blocking
 UA_HEADERS_LIST = [
@@ -154,112 +153,23 @@ def build_plot_lines(hist: pd.DataFrame, fc: pd.DataFrame, title: str, y_title: 
     return fig
 
 
-def build_bar_income(df: pd.DataFrame, metric: str) -> go.Figure:
-    d = df[df["metric"] == metric].sort_values("date").copy()
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=d["date"], y=d["value"], name=metric, marker_color='rgb(55, 83, 109)'))
-
-    ticks = quarter_tickvals(d["date"])
-    fig.update_layout(
-        title=f"GOOGL Income Statement: {metric}",
-        height=520,
-        xaxis_title="Quarter (Period Ending)",
-        yaxis_title=f"{metric} (USD)",
-        margin=dict(l=20, r=20, t=60, b=20),
-    )
-    fig.update_xaxes(
-        tickmode="array",
-        tickvals=ticks,
-        tickformat="%b %Y",
-        showgrid=False
-    )
-    fig.update_yaxes(showgrid=True, gridcolor='rgba(200,200,200,0.2)')
-    return fig
-
-
 # =============================
-# STOCKANALYSIS SEGMENT SCRAPE (QUARTERLY)
+# LOAD SEGMENT DATA FROM CSV
 # =============================
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)  # Cache for 24 hours
 def load_revenue_by_segment_quarterly() -> pd.DataFrame:
-    """Scrape quarterly segment revenue from StockAnalysis"""
-    for attempt, headers in enumerate(UA_HEADERS_LIST, 1):
-        try:
-            time.sleep(0.5)  # Be polite
-            r = requests.get(SEGMENT_URL, headers=headers, timeout=30)
-            r.raise_for_status()
-            
-            soup = BeautifulSoup(r.text, "lxml")
-
-            # Find the History section
-            history_h = None
-            for h in soup.find_all(["h2", "h3"]):
-                if "history" in h.get_text(strip=True).lower():
-                    history_h = h
-                    break
-
-            table = history_h.find_next("table") if history_h else None
-            if table is None:
-                tables = soup.find_all("table")
-                if not tables:
-                    raise ValueError("No tables found on StockAnalysis page.")
-                table = max(tables, key=lambda t: len(t.find_all("tr")))
-
-            thead = table.find("thead")
-            if thead:
-                headers = [c.get_text(" ", strip=True) for c in thead.find_all(["th", "td"])]
-            else:
-                first_row = table.find("tr")
-                headers = [c.get_text(" ", strip=True) for c in first_row.find_all(["th", "td"])]
-
-            headers = [h.replace("\xa0", " ").strip() for h in headers]
-            if headers and headers[0].lower() != "date":
-                headers[0] = "Date"
-
-            rows = []
-            tbody = table.find("tbody") or table
-            for tr in tbody.find_all("tr"):
-                cells = tr.find_all(["td", "th"])
-                if not cells:
-                    continue
-                vals = [c.get_text(" ", strip=True).replace("\xa0", " ") for c in cells]
-                if vals and vals[0].lower() == "date":
-                    continue
-
-                if len(vals) < len(headers):
-                    vals = vals + [""] * (len(headers) - len(vals))
-                elif len(vals) > len(headers):
-                    vals = vals[: len(headers)]
-
-                rows.append(vals)
-
-            wide = pd.DataFrame(rows, columns=headers)
-            wide.rename(columns={"Date": "date"}, inplace=True)
-            wide["date"] = pd.to_datetime(wide["date"], errors="coerce")
-            wide = wide.dropna(subset=["date"]).copy()
-
-            for c in wide.columns:
-                if c != "date":
-                    wide[c] = wide[c].apply(money_to_float)
-
-            wide = wide.sort_values("date").reset_index(drop=True)
-            tidy = wide.melt("date", var_name="product", value_name="revenue").dropna()
-            tidy = tidy.sort_values(["product", "date"]).reset_index(drop=True)
-            tidy["date"] = pd.to_datetime(tidy["date"])
-            
-            # Validation: ensure we have data
-            if len(tidy) < 10:
-                raise ValueError(f"Too few rows parsed: {len(tidy)}")
-            
-            return tidy
-            
-        except Exception as e:
-            if attempt == len(UA_HEADERS_LIST):
-                st.error(f"❌ Failed to load StockAnalysis data after {attempt} attempts: {str(e)}")
-                raise
-            continue
-    
-    raise ValueError("Failed to load segment data")
+    """Load segment revenue data from uploaded CSV"""
+    try:
+        # Try to read the uploaded file
+        df = pd.read_csv('alphabet_revenue_by_segment_tidy.csv')
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values(['product', 'date']).reset_index(drop=True)
+        return df
+    except FileNotFoundError:
+        st.error("CSV file not found. Please ensure 'alphabet_revenue_by_segment_tidy.csv' is in the same directory.")
+        return pd.DataFrame(columns=['date', 'product', 'revenue'])
+    except Exception as e:
+        st.error(f"Error loading CSV: {str(e)}")
+        return pd.DataFrame(columns=['date', 'product', 'revenue'])
 
 
 def segment_sum_total_from_quarterly(seg_q: pd.DataFrame) -> pd.DataFrame:
@@ -319,97 +229,6 @@ def forecast_series(hist_df: pd.DataFrame, years: int, uplift_annual: float, loo
 
 
 # =============================
-# YAHOO INCOME STATEMENT (QUARTERLY)
-# =============================
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)  # Cache for 24 hours
-def load_yahoo_income_quarterly() -> pd.DataFrame:
-    """Scrape quarterly income statement from Yahoo Finance"""
-    for attempt, headers in enumerate(UA_HEADERS_LIST, 1):
-        try:
-            time.sleep(0.5)  # Be polite
-            session = requests.Session()
-            session.headers.update(headers)
-            
-            # First get cookies
-            r = session.get("https://finance.yahoo.com", timeout=15)
-            time.sleep(1)
-            
-            # Then get the financials page
-            r = session.get(YAHOO_FIN_URL, timeout=30)
-            r.raise_for_status()
-            html = r.text
-
-            # Try to find the embedded JSON data
-            m = re.search(r"root\.App\.main\s*=\s*(\{.*?\});\s*\n", html, flags=re.DOTALL)
-            if not m:
-                raise ValueError("Could not find Yahoo embedded JSON (root.App.main).")
-
-            data = json.loads(m.group(1))
-            stores = data.get("context", {}).get("dispatcher", {}).get("stores", {})
-            qss = stores.get("QuoteSummaryStore", {})
-
-            inc_q = qss.get("incomeStatementHistoryQuarterly", {}).get("incomeStatementHistory", [])
-            if not inc_q:
-                raise ValueError("Yahoo quarterly income statement data not found.")
-
-            rows = []
-            for entry in inc_q:
-                end = entry.get("endDate", {}).get("raw", None)
-                if end is None:
-                    continue
-
-                dt = pd.to_datetime(int(end), unit="s", errors="coerce")
-                dt = snap_to_quarter_end(dt)
-
-                for k, v in entry.items():
-                    if k in ["maxAge", "endDate"]:
-                        continue
-                    if isinstance(v, dict) and "raw" in v:
-                        val = v.get("raw", None)
-                        if val is None:
-                            continue
-                        rows.append({"date": dt, "metric": k, "value": float(val)})
-
-            df = pd.DataFrame(rows)
-            if df.empty:
-                raise ValueError("Yahoo income statement parsed but produced no rows.")
-
-            pretty = {
-                "totalRevenue": "Total Revenue",
-                "costOfRevenue": "Cost of Revenue",
-                "grossProfit": "Gross Profit",
-                "researchDevelopment": "Research & Development",
-                "sellingGeneralAdministrative": "Selling, General & Admin",
-                "totalOperatingExpenses": "Operating Expenses",
-                "operatingIncome": "Operating Income",
-                "interestExpense": "Interest Expense",
-                "totalOtherIncomeExpenseNet": "Other Income/Expense",
-                "incomeBeforeTax": "EBT (Income Before Tax)",
-                "incomeTaxExpense": "Income Tax Expense",
-                "netIncome": "Net Income",
-                "ebit": "EBIT",
-                "ebitda": "EBITDA",
-            }
-            df["metric"] = df["metric"].map(lambda x: pretty.get(x, x))
-            df = df.sort_values(["metric", "date"]).reset_index(drop=True)
-            
-            # Validation
-            if len(df) < 20:
-                raise ValueError(f"Too few rows in Yahoo data: {len(df)}")
-            
-            return df
-            
-        except Exception as e:
-            if attempt == len(UA_HEADERS_LIST):
-                st.warning(f"⚠️ Yahoo Finance data unavailable: {str(e)}")
-                # Return empty dataframe as fallback
-                return pd.DataFrame(columns=["date", "metric", "value"])
-            continue
-    
-    return pd.DataFrame(columns=["date", "metric", "value"])
-
-
-# =============================
 # HEADER
 # =============================
 col1, col2 = st.columns([1, 12])
@@ -421,9 +240,9 @@ with col1:
 with col2:
     st.markdown(
         """
-        # 📊 Alphabet (Google) Revenue Forecast Dashboard
+        # Alphabet (Google) Revenue Forecast Dashboard
         Interactive segment-level **quarterly** analysis and scenario forecasting.  
-        **Data sources:** StockAnalysis (segment revenue) + Yahoo Finance (income statement)
+        **Data source:** Revenue by segment (quarterly data)
         """
     )
 
@@ -433,9 +252,9 @@ st.markdown("---")
 # =============================
 # SIDEBAR
 # =============================
-st.sidebar.title("⚙️ Controls")
+st.sidebar.title("Controls")
 
-if st.sidebar.button("🔄 Force Refresh Data", help="Clear cache and reload all data"):
+if st.sidebar.button("Force Refresh Data", help="Clear cache and reload all data"):
     st.cache_data.clear()
     st.rerun()
 
@@ -456,30 +275,30 @@ lookback = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("💡 **Tip:** Increase 'Extra annual growth' to model optimistic scenarios")
+st.sidebar.caption("Tip: Increase 'Extra annual growth' to model optimistic scenarios")
 
 
 # =============================
 # LOAD DATA
 # =============================
-with st.spinner("Loading segment data from StockAnalysis..."):
-    try:
-        seg_q = load_revenue_by_segment_quarterly()
-        st.sidebar.success(f"✅ Loaded {len(seg_q)} segment records")
-    except Exception as e:
-        st.error(f"❌ Failed to load segment data: {str(e)}")
-        st.stop()
+seg_q = load_revenue_by_segment_quarterly()
+
+if seg_q.empty:
+    st.error("No data loaded. Please check the CSV file.")
+    st.stop()
+
+st.sidebar.success(f"Loaded {len(seg_q)} segment records")
 
 products = sorted(seg_q["product"].unique().tolist())
 default_product = "Advertising" if "Advertising" in products else products[0]
-product = st.sidebar.selectbox("📦 Product Segment", products, index=products.index(default_product))
+product = st.sidebar.selectbox("Product Segment", products, index=products.index(default_product))
 
 
 # =============================
 # TABS
 # =============================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📈 Segment Forecast", "💰 Total Revenue Forecast", "📋 Data Check", "📊 Income Statement", "⬇️ Download"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Segment Forecast", "Total Revenue Forecast", "Data Check", "Download"]
 )
 
 # TAB 1: SEGMENT FORECAST
@@ -525,7 +344,7 @@ with tab1:
         st.plotly_chart(fig, use_container_width=True)
         
         # Show recent data
-        with st.expander("📊 View recent quarterly data"):
+        with st.expander("View recent quarterly data"):
             recent = seg.tail(12).copy()
             recent["Period"] = pd.to_datetime(recent["date"]).dt.strftime("%b %Y")
             recent["Revenue"] = recent["revenue"].apply(money_fmt)
@@ -594,45 +413,9 @@ with tab2:
     )
     st.plotly_chart(fig_total, use_container_width=True)
 
-    # Validation against Yahoo
-    st.markdown("---")
-    st.subheader("🔍 Data Validation")
-    
-    try:
-        inc = load_yahoo_income_quarterly()
-        if not inc.empty:
-            yrev = inc[inc["metric"] == "Total Revenue"].sort_values("date")
-            if not yrev.empty:
-                ymatch = yrev[yrev["date"] == last_date]
-                if not ymatch.empty:
-                    yahoo_last = float(ymatch["value"].iloc[-1])
-                    diff = last_q_total - yahoo_last
-                    diff_pct = (diff / yahoo_last * 100) if yahoo_last > 0 else 0
-
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("StockAnalysis Total", money_fmt(last_q_total))
-                    col2.metric("Yahoo Total Revenue", money_fmt(yahoo_last))
-                    col3.metric("Difference", money_fmt(diff))
-                    col4.metric("Difference %", f"{diff_pct:.2f}%")
-
-                    if abs(diff_pct) < 1:
-                        st.success("✅ Data sources match closely (within 1%)")
-                    elif abs(diff_pct) < 5:
-                        st.info("ℹ️ Small discrepancy between sources (within 5%)")
-                    else:
-                        st.warning(f"⚠️ Notable difference between sources ({diff_pct:.1f}%)")
-                else:
-                    st.info("Yahoo Finance data for the latest quarter not yet available")
-            else:
-                st.warning("Yahoo Total Revenue data not found")
-        else:
-            st.warning("Yahoo Finance data unavailable - validation skipped")
-    except Exception as e:
-        st.warning(f"Could not validate with Yahoo Finance: {str(e)}")
-
 # TAB 3: DATA CHECK
 with tab3:
-    st.subheader("📋 Segment Data Quality Check")
+    st.subheader("Segment Data Quality Check")
     
     latest_dt = seg_q["date"].max()
     latest_dt_str = pd.to_datetime(latest_dt).strftime("%b %d, %Y")
@@ -642,7 +425,7 @@ with tab3:
     # Check data freshness
     days_old = (pd.Timestamp.now() - pd.Timestamp(latest_dt)).days
     if days_old > 120:
-        st.warning(f"⚠️ Data may be stale ({days_old} days old). Consider refreshing.")
+        st.warning(f"Data may be stale ({days_old} days old). Consider refreshing.")
     
     # Latest quarter breakdown
     chk = seg_q[seg_q["date"] == latest_dt].copy().sort_values("revenue", ascending=False)
@@ -681,52 +464,9 @@ with tab3:
         hide_index=True
     )
 
-# TAB 4: INCOME STATEMENT
+# TAB 4: DOWNLOAD
 with tab4:
-    st.subheader("📊 Income Statement (Yahoo Finance: GOOGL)")
-    
-    try:
-        inc = load_yahoo_income_quarterly()
-        
-        if inc.empty:
-            st.warning("⚠️ Yahoo Finance data is currently unavailable. This may be due to rate limiting or site changes.")
-            st.info("💡 The segment forecasts in other tabs are still accurate and use StockAnalysis data.")
-        else:
-            metric_list = sorted(inc["metric"].unique().tolist())
-            default_metric = "Total Revenue" if "Total Revenue" in metric_list else (metric_list[0] if metric_list else None)
-            
-            if default_metric:
-                metric = st.selectbox("Select Metric", metric_list, index=metric_list.index(default_metric))
-
-                fig_inc = build_bar_income(inc, metric)
-                st.plotly_chart(fig_inc, use_container_width=True)
-
-                # Data table
-                mdf = inc[inc["metric"] == metric].sort_values("date", ascending=False).copy()
-                mdf["Period Ending"] = pd.to_datetime(mdf["date"]).dt.strftime("%b %Y")
-                mdf["Value"] = mdf["value"].apply(money_fmt)
-                
-                # Calculate YoY growth if enough data
-                if len(mdf) >= 5:
-                    mdf_sorted = mdf.sort_values("date")
-                    mdf_sorted["YoY Growth"] = mdf_sorted["value"].pct_change(4)
-                    mdf = mdf_sorted.sort_values("date", ascending=False)
-                    mdf["YoY Growth"] = mdf["YoY Growth"].apply(lambda x: f"{x*100:.1f}%" if not np.isnan(x) else "—")
-                    cols_to_show = ["Period Ending", "Value", "YoY Growth"]
-                else:
-                    cols_to_show = ["Period Ending", "Value"]
-                
-                st.dataframe(mdf[cols_to_show], use_container_width=True, hide_index=True)
-            else:
-                st.warning("No metrics available in Yahoo data")
-                
-    except Exception as e:
-        st.error(f"Error loading Yahoo Finance data: {str(e)}")
-        st.info("This tab requires Yahoo Finance access. The other tabs work independently using StockAnalysis data.")
-
-# TAB 5: DOWNLOAD
-with tab5:
-    st.subheader("⬇️ Download Data")
+    st.subheader("Download Data")
 
     st.markdown("Export the underlying data used in this dashboard for further analysis.")
     
@@ -739,7 +479,7 @@ with tab5:
     
     with col1:
         st.download_button(
-            label="📥 Download Segment Data (Tidy Format)",
+            label="Download Segment Data (Tidy Format)",
             data=seg_download.to_csv(index=False).encode("utf-8"),
             file_name="alphabet_segments_quarterly_tidy.csv",
             mime="text/csv",
@@ -753,31 +493,12 @@ with tab5:
     
     with col2:
         st.download_button(
-            label="📥 Download Segment Data (Wide Format)",
+            label="Download Segment Data (Wide Format)",
             data=wide_out.to_csv(index=False).encode("utf-8"),
             file_name="alphabet_segments_quarterly_wide.csv",
             mime="text/csv",
             help="Wide format with date as rows and segments as columns"
         )
-
-    # Yahoo income statement
-    try:
-        inc = load_yahoo_income_quarterly()
-        if not inc.empty:
-            inc_download = inc.copy()
-            inc_download["date"] = pd.to_datetime(inc_download["date"]).dt.strftime("%Y-%m-%d")
-            
-            st.download_button(
-                label="📥 Download Income Statement (Yahoo Finance)",
-                data=inc_download.to_csv(index=False).encode("utf-8"),
-                file_name="yahoo_income_statement_quarterly.csv",
-                mime="text/csv",
-                help="Quarterly income statement metrics from Yahoo Finance"
-            )
-        else:
-            st.info("Yahoo Finance data not available for download")
-    except:
-        st.info("Yahoo Finance data not available for download")
     
     st.markdown("---")
-    st.caption("💾 All data is exported in CSV format for easy import into Excel, Python, R, or other analysis tools.")
+    st.caption("All data is exported in CSV format for easy import into Excel, Python, R, or other analysis tools.")
