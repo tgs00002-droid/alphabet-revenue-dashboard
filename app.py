@@ -1,5 +1,4 @@
 import re
-import json
 from typing import Tuple, List
 
 import numpy as np
@@ -15,7 +14,6 @@ import streamlit as st
 # CONFIG
 # =============================
 SEGMENT_URL = "https://stockanalysis.com/stocks/goog/metrics/revenue-by-segment/"
-YAHOO_FIN_URL = "https://finance.yahoo.com/quote/GOOGL/financials"
 
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -83,9 +81,7 @@ def money_fmt(x: float) -> str:
 
 def snap_to_quarter_end(dt: pd.Timestamp) -> pd.Timestamp:
     """
-    IMPORTANT FIX:
-    Yahoo sometimes hands back month-end dates that are NOT true quarter ends.
-    We snap to the next quarter end (QuarterEnd(0) => quarter-end on/after dt).
+    Snap to the next quarter end (QuarterEnd(0) => quarter-end on/after dt).
     Example: Nov 30 -> Dec 31, Jan 31 -> Mar 31, May 31 -> Jun 30, etc.
     """
     if pd.isna(dt):
@@ -131,33 +127,6 @@ def build_plot_lines(hist: pd.DataFrame, fc: pd.DataFrame, title: str, y_title: 
         xaxis_title="Quarter",
         yaxis_title=y_title,
         hovermode="x unified",
-        margin=dict(l=20, r=20, t=60, b=20),
-    )
-    fig.update_xaxes(
-        tickmode="array",
-        tickvals=ticks,
-        tickformat="%b %d, %Y",
-        showgrid=False
-    )
-    return fig
-
-
-def build_bar_income(df: pd.DataFrame, metric: str) -> go.Figure:
-    d = df[df["metric"] == metric].sort_values("date").copy()
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=d["date"],
-        y=d["value"],
-        name=metric
-    ))
-
-    ticks = quarter_tickvals(d["date"])
-    fig.update_layout(
-        title=f"GOOGL Income Statement: {metric}",
-        height=520,
-        xaxis_title="Quarter (Period Ending)",
-        yaxis_title=f"{metric} (USD)",
         margin=dict(l=20, r=20, t=60, b=20),
     )
     fig.update_xaxes(
@@ -239,14 +208,6 @@ def load_revenue_by_segment_quarterly() -> pd.DataFrame:
     return tidy
 
 
-def compute_ttm_from_quarterly(tidy_q: pd.DataFrame) -> pd.DataFrame:
-    df = tidy_q.copy()
-    df = df.sort_values(["product", "date"])
-    df["revenue_ttm"] = df.groupby("product")["revenue"].transform(lambda s: s.rolling(4, min_periods=4).sum())
-    out = df.dropna(subset=["revenue_ttm"]).rename(columns={"revenue_ttm": "revenue"})
-    return out[["date", "product", "revenue"]].reset_index(drop=True)
-
-
 def pick_total_components(cols: List[str]) -> List[str]:
     preferred_leaf = [
         "Google Search & Other",
@@ -318,103 +279,6 @@ def forecast_series(hist_df: pd.DataFrame, years: int, uplift_annual: float, loo
 
 
 # =============================
-# YAHOO INCOME STATEMENT SCRAPE (FIXED JSON PARSE + FIXED DATES)
-# =============================
-@st.cache_data(ttl=60 * 60, show_spinner=False)
-def load_yahoo_income_quarterly() -> pd.DataFrame:
-    def extract_root_app_main_json(html: str) -> dict:
-        marker = "root.App.main ="
-        i = html.find(marker)
-        if i == -1:
-            raise ValueError("Could not find 'root.App.main =' in Yahoo HTML.")
-
-        j = html.find("{", i)
-        if j == -1:
-            raise ValueError("Could not find opening '{' for Yahoo embedded JSON.")
-
-        depth = 0
-        in_str = False
-        esc = False
-        for k in range(j, len(html)):
-            ch = html[k]
-
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-            else:
-                if ch == '"':
-                    in_str = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        json_text = html[j:k+1]
-                        return json.loads(json_text)
-
-        raise ValueError("Failed to extract Yahoo embedded JSON by brace-matching.")
-
-    r = requests.get(YAHOO_FIN_URL, headers=UA_HEADERS, timeout=30)
-    r.raise_for_status()
-    html = r.text
-
-    data = extract_root_app_main_json(html)
-
-    stores = data.get("context", {}).get("dispatcher", {}).get("stores", {})
-    qss = stores.get("QuoteSummaryStore", {})
-
-    inc_q = qss.get("incomeStatementHistoryQuarterly", {}).get("incomeStatementHistory", [])
-    if not inc_q:
-        raise ValueError("Yahoo quarterly income statement data not found (incomeStatementHistoryQuarterly empty).")
-
-    rows = []
-    for entry in inc_q:
-        end = entry.get("endDate", {}).get("raw", None)
-        if end is None:
-            continue
-
-        dt = pd.to_datetime(int(end), unit="s", errors="coerce")
-        dt = snap_to_quarter_end(dt)
-
-        for k, v in entry.items():
-            if k in ["maxAge", "endDate"]:
-                continue
-            if isinstance(v, dict) and "raw" in v:
-                val = v.get("raw", None)
-                if val is None:
-                    continue
-                rows.append({"date": dt, "metric": k, "value": float(val)})
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        raise ValueError("Yahoo income statement parsed but produced no rows.")
-
-    pretty = {
-        "totalRevenue": "Total Revenue",
-        "costOfRevenue": "Cost of Revenue",
-        "grossProfit": "Gross Profit",
-        "researchDevelopment": "Research & Development",
-        "sellingGeneralAdministrative": "Selling, General & Admin",
-        "totalOperatingExpenses": "Operating Expenses",
-        "operatingIncome": "Operating Income",
-        "interestExpense": "Interest Expense",
-        "interestIncome": "Interest & Investment Income",
-        "incomeBeforeTax": "EBT (Income Before Tax)",
-        "incomeTaxExpense": "Income Tax Expense",
-        "netIncome": "Net Income",
-        "ebit": "EBIT",
-        "ebitda": "EBITDA",
-    }
-    df["metric"] = df["metric"].map(lambda x: pretty.get(x, x))
-    df = df.sort_values(["metric", "date"]).reset_index(drop=True)
-    return df
-
-
-# =============================
 # HEADER
 # =============================
 col1, col2 = st.columns([1, 12])
@@ -427,8 +291,8 @@ with col2:
     st.markdown(
         """
         # Alphabet (Google) Revenue Forecast Dashboard
-        Interactive segment-level **quarterly + TTM** analysis and scenario forecasting.  
-        Data sources: **StockAnalysis** (segment revenue) + **Yahoo Finance** (income statement).
+        Interactive segment-level **quarterly** analysis and scenario forecasting.  
+        Data source: **StockAnalysis** (segment revenue).
         """
     )
 
@@ -447,18 +311,12 @@ if st.sidebar.button("Force Refresh (ignore cache)"):
 years = st.sidebar.slider("Forecast years", min_value=1, max_value=10, value=3, step=1)
 uplift = st.sidebar.slider("Extra CAGR uplift (scenario, annual)", min_value=0.00, max_value=0.30, value=0.00, step=0.01)
 
-view_mode = st.sidebar.radio(
-    "View mode",
-    ["Quarterly", "TTM (matches StockAnalysis chart)"],
-    index=0
-)
-
 
 # =============================
 # LOAD DATA
 # =============================
 seg_q = load_revenue_by_segment_quarterly()
-seg_active = seg_q if view_mode == "Quarterly" else compute_ttm_from_quarterly(seg_q)
+seg_active = seg_q  # ✅ quarterly only (no TTM)
 
 products = sorted(seg_active["product"].unique().tolist())
 default_product = "Advertising" if "Advertising" in products else products[0]
@@ -468,8 +326,8 @@ product = st.sidebar.selectbox("Product", products, index=products.index(default
 # =============================
 # TABS
 # =============================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Segment Forecast", "Total Forecast", "Segment Table Check", "Income Statement", "Download"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Segment Forecast", "Total Forecast", "Segment Table Check", "Download"]
 )
 
 
@@ -488,12 +346,11 @@ with tab1:
     k2.metric("Δ vs Baseline", money_fmt(delta))
     k3.metric("Last Reported Quarter", pd.to_datetime(seg["date"].max()).strftime("%b %d, %Y"))
 
-    y_title = "Revenue (USD, Quarterly)" if view_mode == "Quarterly" else "Revenue (USD, TTM)"
     fig = build_plot_lines(
         seg[["date", "revenue"]],
         fc,
         title=f"{product}: Historical + {years}-Year Forecast (uplift {uplift*100:.1f}%)",
-        y_title=y_title
+        y_title="Revenue (USD, Quarterly)"
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -531,14 +388,11 @@ with tab2:
 
     total_fc = pd.DataFrame({"date": future_dates, "forecast": total_fc_vals, "hi": total_hi_vals, "lo": total_lo_vals})
 
-    title_mode = "Quarterly" if view_mode == "Quarterly" else "TTM"
-    y_title = "Revenue (USD, Quarterly)" if view_mode == "Quarterly" else "Revenue (USD, TTM)"
-
     fig_total = build_plot_lines(
         total_hist[["date", "revenue"]],
         total_fc,
-        title=f"Total Alphabet Revenue Forecast ({title_mode}, Scenario)",
-        y_title=y_title
+        title="Total Alphabet Revenue Forecast (Quarterly, Scenario)",
+        y_title="Revenue (USD, Quarterly)"
     )
     st.plotly_chart(fig_total, use_container_width=True)
     st.caption("Total uses non-overlapping segment components to avoid double counting.")
@@ -554,8 +408,6 @@ with tab3:
     st.dataframe(chk[["product", "revenue_fmt"]], use_container_width=True)
 
 
-
-
 # TAB 4
 with tab4:
     st.subheader("Download data")
@@ -566,7 +418,7 @@ with tab4:
     st.download_button(
         label="Download segment dataset (tidy) as CSV",
         data=seg_download.to_csv(index=False).encode("utf-8"),
-        file_name=("alphabet_segments_quarterly.csv" if view_mode == "Quarterly" else "alphabet_segments_ttm.csv"),
+        file_name="alphabet_segments_quarterly.csv",
         mime="text/csv",
     )
 
@@ -576,13 +428,6 @@ with tab4:
     st.download_button(
         label="Download segment dataset (wide) as CSV",
         data=wide_out.to_csv(index=False).encode("utf-8"),
-        file_name=("alphabet_segments_wide_quarterly.csv" if view_mode == "Quarterly" else "alphabet_segments_wide_ttm.csv"),
-        mime="text/csv",
-    )
-
-    st.download_button(
-        label="Download Yahoo income statement (quarterly) as CSV",
-        data=inc.to_csv(index=False).encode("utf-8"),
-        file_name="yahoo_income_statement_quarterly.csv",
+        file_name="alphabet_segments_wide_quarterly.csv",
         mime="text/csv",
     )
