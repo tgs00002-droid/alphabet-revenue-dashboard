@@ -1,6 +1,7 @@
 import re
+import json
+from typing import Tuple, List
 import time
-from typing import Tuple, List, Dict
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,9 @@ import streamlit as st
 # =============================
 SEGMENT_URL = "https://stockanalysis.com/stocks/goog/metrics/revenue-by-segment/"
 FINANCIALS_URL = "https://stockanalysis.com/stocks/goog/financials/"
+REVENUE_URL = "https://stockanalysis.com/stocks/goog/revenue/"  # ✅ official quarterly total revenue page
 
+# Rotate user agents to avoid blocking
 UA_HEADERS_LIST = [
     {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -32,7 +35,10 @@ UA_HEADERS_LIST = [
     }
 ]
 
-st.set_page_config(page_title="Alphabet (Google) Revenue Forecast Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Alphabet (Google) Revenue Forecast Dashboard",
+    layout="wide",
+)
 
 
 # =============================
@@ -129,7 +135,6 @@ def build_plot_lines(hist: pd.DataFrame, fc: pd.DataFrame, title: str, y_title: 
     ))
 
     ticks = quarter_tickvals(pd.concat([hist["date"], fc["date"]], ignore_index=True))
-
     fig.update_layout(
         title=title,
         height=520,
@@ -142,7 +147,7 @@ def build_plot_lines(hist: pd.DataFrame, fc: pd.DataFrame, title: str, y_title: 
     fig.update_xaxes(
         tickmode="array",
         tickvals=ticks,
-        tickformat="%b %Y",  # shows Dec/Mar/Jun/Sep + year
+        tickformat="%b %Y",  # ✅ Dec / Mar / Jun / Sep with year
         showgrid=True,
         gridcolor='rgba(200,200,200,0.2)'
     )
@@ -150,94 +155,12 @@ def build_plot_lines(hist: pd.DataFrame, fc: pd.DataFrame, title: str, y_title: 
     return fig
 
 
-def _best_table_by_rows(soup: BeautifulSoup) -> BeautifulSoup:
-    tables = soup.find_all("table")
-    if not tables:
-        raise ValueError("No tables found on page.")
-    return max(tables, key=lambda t: len(t.find_all("tr")))
-
-
-def _parse_html_table_to_df(table: BeautifulSoup) -> pd.DataFrame:
-    thead = table.find("thead")
-    if thead:
-        headers = [c.get_text(" ", strip=True) for c in thead.find_all(["th", "td"])]
-    else:
-        first_row = table.find("tr")
-        headers = [c.get_text(" ", strip=True) for c in first_row.find_all(["th", "td"])]
-
-    headers = [h.replace("\xa0", " ").strip() for h in headers]
-    if headers and headers[0].lower() != "date":
-        headers[0] = "Date"
-
-    rows = []
-    tbody = table.find("tbody") or table
-    for tr in tbody.find_all("tr"):
-        cells = tr.find_all(["td", "th"])
-        if not cells:
-            continue
-        vals = [c.get_text(" ", strip=True).replace("\xa0", " ") for c in cells]
-        if vals and vals[0].strip().lower() in ["date", "period ending"]:
-            continue
-
-        if len(vals) < len(headers):
-            vals = vals + [""] * (len(headers) - len(vals))
-        elif len(vals) > len(headers):
-            vals = vals[: len(headers)]
-
-        rows.append(vals)
-
-    return pd.DataFrame(rows, columns=headers)
-
-
-def detect_total_like_columns(wide_q: pd.DataFrame, tol: float = 0.02, min_quarters: int = 6) -> List[str]:
-    """
-    Detect columns that are essentially the sum of other columns (prevents double counting).
-    Example: if table contains both 'Google Services' and also its components, or a 'Total'.
-    """
-    if wide_q.shape[1] <= 2:
-        return []
-
-    cols = [c for c in wide_q.columns if c != "date"]
-    df = wide_q.set_index("date")[cols].copy()
-
-    df = df.dropna(how="all")
-    if len(df) < min_quarters:
-        return []
-
-    suspects = []
-
-    for c in cols:
-        others = [x for x in cols if x != c]
-        if not others:
-            continue
-
-        c_series = df[c]
-        others_sum = df[others].sum(axis=1, min_count=1)
-
-        mask = c_series.notna() & others_sum.notna() & (c_series != 0)
-        if mask.sum() < min_quarters:
-            continue
-
-        rel_err = ((c_series[mask] - others_sum[mask]).abs() / c_series[mask].abs())
-        med = float(rel_err.median()) if len(rel_err) else np.inf
-
-        if med <= tol:
-            suspects.append(c)
-
-    # also catch explicit "total" names
-    for c in cols:
-        if re.search(r"(?i)\btotal\b", str(c)):
-            if c not in suspects:
-                suspects.append(c)
-
-    return suspects
-
-
 # =============================
 # STOCKANALYSIS SEGMENT SCRAPE (QUARTERLY)
 # =============================
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def load_revenue_by_segment_quarterly() -> pd.DataFrame:
+    """Scrape quarterly segment revenue from StockAnalysis"""
     for attempt, headers in enumerate(UA_HEADERS_LIST, 1):
         try:
             time.sleep(0.5)
@@ -246,7 +169,7 @@ def load_revenue_by_segment_quarterly() -> pd.DataFrame:
 
             soup = BeautifulSoup(r.text, "lxml")
 
-            # Prefer the History table if available
+            # Find the History section
             history_h = None
             for h in soup.find_all(["h2", "h3"]):
                 if "history" in h.get_text(strip=True).lower():
@@ -255,25 +178,54 @@ def load_revenue_by_segment_quarterly() -> pd.DataFrame:
 
             table = history_h.find_next("table") if history_h else None
             if table is None:
-                table = _best_table_by_rows(soup)
+                tables = soup.find_all("table")
+                if not tables:
+                    raise ValueError("No tables found on StockAnalysis page.")
+                table = max(tables, key=lambda t: len(t.find_all("tr")))
 
-            wide = _parse_html_table_to_df(table)
-            wide.rename(columns={"Date": "date", "Period Ending": "date"}, inplace=True)
+            thead = table.find("thead")
+            if thead:
+                headers = [c.get_text(" ", strip=True) for c in thead.find_all(["th", "td"])]
+            else:
+                first_row = table.find("tr")
+                headers = [c.get_text(" ", strip=True) for c in first_row.find_all(["th", "td"])]
 
+            headers = [h.replace("\xa0", " ").strip() for h in headers]
+            if headers and headers[0].lower() != "date":
+                headers[0] = "Date"
+
+            rows = []
+            tbody = table.find("tbody") or table
+            for tr in tbody.find_all("tr"):
+                cells = tr.find_all(["td", "th"])
+                if not cells:
+                    continue
+                vals = [c.get_text(" ", strip=True).replace("\xa0", " ") for c in cells]
+                if vals and vals[0].lower() == "date":
+                    continue
+
+                if len(vals) < len(headers):
+                    vals = vals + [""] * (len(headers) - len(vals))
+                elif len(vals) > len(headers):
+                    vals = vals[: len(headers)]
+
+                rows.append(vals)
+
+            wide = pd.DataFrame(rows, columns=headers)
+            wide.rename(columns={"Date": "date"}, inplace=True)
             wide["date"] = pd.to_datetime(wide["date"], errors="coerce")
             wide = wide.dropna(subset=["date"]).copy()
-            wide["date"] = wide["date"].apply(snap_to_quarter_end)
 
             for c in wide.columns:
                 if c != "date":
                     wide[c] = wide[c].apply(money_to_float)
 
             wide = wide.sort_values("date").reset_index(drop=True)
-
             tidy = wide.melt("date", var_name="product", value_name="revenue").dropna()
             tidy = tidy.sort_values(["product", "date"]).reset_index(drop=True)
+            tidy["date"] = pd.to_datetime(tidy["date"]).apply(snap_to_quarter_end)
 
-            # Basic sanity check
+            # Validation
             if len(tidy) < 10:
                 raise ValueError(f"Too few rows parsed: {len(tidy)}")
 
@@ -281,43 +233,124 @@ def load_revenue_by_segment_quarterly() -> pd.DataFrame:
 
         except Exception as e:
             if attempt == len(UA_HEADERS_LIST):
-                st.error(f"Failed to load StockAnalysis segment data after {attempt} attempts: {str(e)}")
+                st.error(f"Failed to load StockAnalysis data after {attempt} attempts: {str(e)}")
                 raise
             continue
 
     raise ValueError("Failed to load segment data")
 
 
-def segment_sum_total_from_quarterly(seg_q: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Build TOTAL from quarterly segment row sums, after removing any total-like columns.
-    Returns (total_df, removed_columns)
-    """
-    wide_q = (
-        seg_q.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum")
-        .sort_index()
-        .reset_index()
-    )
-    removed = detect_total_like_columns(wide_q, tol=0.02, min_quarters=6)
-
-    cols_to_sum = [c for c in wide_q.columns if c not in ["date"] + removed]
-    total = wide_q[cols_to_sum].set_index("date").sum(axis=1, min_count=1)
-
+def segment_sum_total_from_quarterly(seg_q: pd.DataFrame) -> pd.DataFrame:
+    """Build TOTAL from the quarterly segment row sums"""
+    wide_q = seg_q.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum").sort_index()
+    wide_q = wide_q.dropna(how="all")
+    total = wide_q.sum(axis=1, min_count=1)
     out = total.reset_index().rename(columns={0: "revenue"})
     out.columns = ["date", "revenue"]
-    out = out.sort_values("date").reset_index(drop=True)
-    return out, removed
+    return out
 
 
 # =============================
-# STOCKANALYSIS FINANCIALS SCRAPE (TOTAL REVENUE, QUARTERLY)
+# STOCKANALYSIS TOTAL REVENUE SCRAPE (OFFICIAL /revenue/ PAGE)
+# =============================
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def load_total_revenue_from_revenue_page() -> pd.DataFrame:
+    """
+    Scrape quarterly total revenue from:
+    https://stockanalysis.com/stocks/goog/revenue/
+
+    Pulls the 'Revenue History' table (Quarter Ended, Revenue).
+    Values like 102.35B, 723.00M -> converted to dollars.
+    """
+    for attempt, headers in enumerate(UA_HEADERS_LIST, 1):
+        try:
+            time.sleep(0.5)
+            r = requests.get(REVENUE_URL + "?p=quarterly", headers=headers, timeout=30)
+            r.raise_for_status()
+
+            soup = BeautifulSoup(r.text, "lxml")
+
+            # Find "Revenue History" heading
+            revenue_h = None
+            for h in soup.find_all(["h2", "h3"]):
+                if "revenue history" in h.get_text(" ", strip=True).lower():
+                    revenue_h = h
+                    break
+
+            table = revenue_h.find_next("table") if revenue_h else None
+            if table is None:
+                tables = soup.find_all("table")
+                if not tables:
+                    raise ValueError("No tables found on revenue page.")
+                table = max(tables, key=lambda t: len(t.find_all("tr")))
+
+            # Read header
+            head_tr = table.find("tr")
+            if head_tr is None:
+                raise ValueError("No header row found on revenue history table.")
+
+            header_cells = head_tr.find_all(["th", "td"])
+            header = [c.get_text(" ", strip=True).lower() for c in header_cells]
+
+            def find_col(options):
+                for i, htxt in enumerate(header):
+                    for opt in options:
+                        if opt in htxt:
+                            return i
+                return None
+
+            col_q = find_col(["quarter ended", "date", "period"])
+            col_r = find_col(["revenue"])
+
+            if col_q is None or col_r is None:
+                raise ValueError("Could not find Quarter Ended / Revenue columns.")
+
+            data = []
+            for tr in table.find_all("tr")[1:]:
+                tds = tr.find_all(["td", "th"])
+                if not tds:
+                    continue
+                vals = [td.get_text(" ", strip=True).replace("\xa0", " ") for td in tds]
+                if len(vals) <= max(col_q, col_r):
+                    continue
+
+                q_text = vals[col_q].strip()
+                r_text = vals[col_r].strip()
+                if not q_text or q_text.lower() in ["quarter ended", "date"]:
+                    continue
+
+                dt = pd.to_datetime(q_text, errors="coerce")
+                if pd.isna(dt):
+                    continue
+                dt = snap_to_quarter_end(dt)
+
+                rev = money_to_float(r_text)
+                if pd.isna(rev):
+                    continue
+
+                data.append({"date": dt, "revenue": float(rev)})
+
+            df = pd.DataFrame(data).dropna()
+            if df.empty or len(df) < 4:
+                raise ValueError("Insufficient quarterly revenue parsed from /revenue/ page.")
+
+            return df.sort_values("date").reset_index(drop=True)
+
+        except Exception as e:
+            if attempt == len(UA_HEADERS_LIST):
+                st.error(f"Failed to load total revenue from /revenue/ page: {str(e)}")
+                raise
+            continue
+
+    raise ValueError("Failed to load total revenue from /revenue/ page")
+
+
+# =============================
+# STOCKANALYSIS FINANCIALS SCRAPE
 # =============================
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def load_total_revenue_from_financials() -> pd.DataFrame:
-    """
-    Scrape total revenue from StockAnalysis income statement quarterly page.
-    StockAnalysis displays financials in millions USD. We convert to dollars.
-    """
+    """Scrape total revenue from StockAnalysis financials page (quarterly)"""
     for attempt, headers in enumerate(UA_HEADERS_LIST, 1):
         try:
             time.sleep(0.5)
@@ -325,74 +358,66 @@ def load_total_revenue_from_financials() -> pd.DataFrame:
             r.raise_for_status()
 
             soup = BeautifulSoup(r.text, "lxml")
-            table = soup.find("table")
-            if table is None:
-                raise ValueError("No main financials table found")
 
-            # Parse header dates
+            # Find the main financial table
+            tables = soup.find_all("table")
+            if not tables:
+                raise ValueError("No tables found on financials page")
+
+            table = tables[0]  # Main income statement table
+
+            # Get headers
             thead = table.find("thead")
             if not thead:
-                raise ValueError("No financials table header found")
+                raise ValueError("No table headers found")
 
-            header_tr = thead.find("tr")
-            ths = header_tr.find_all("th") if header_tr else []
-            date_labels = []
-            for th in ths[1:]:
-                t = th.get_text(" ", strip=True)
-                if t and t.upper() != "TTM":
-                    date_labels.append(t)
+            header_rows = thead.find_all("tr")
+            dates = []
+            for th in header_rows[0].find_all("th")[1:]:  # Skip first column (label)
+                date_text = th.get_text(strip=True)
+                if date_text and date_text not in ["TTM", "FY 2024", "FY 2023"]:
+                    dates.append(date_text)
 
-            # Find the Revenue row (exact label "Revenue")
+            # Get Revenue row
             tbody = table.find("tbody")
             if not tbody:
-                raise ValueError("No financials table body found")
+                raise ValueError("No table body found")
 
             revenue_row = None
-            for tr in tbody.find_all("tr"):
-                first = tr.find("td")
-                if not first:
-                    continue
-                label = first.get_text(" ", strip=True).lower()
-                if label == "revenue":
-                    revenue_row = tr
-                    break
-            if revenue_row is None:
-                raise ValueError("Revenue row not found")
+            for row in tbody.find_all("tr"):
+                first_cell = row.find("td")
+                if first_cell and "revenue" in first_cell.get_text(strip=True).lower():
+                    if first_cell.get_text(strip=True).lower() == "revenue":
+                        revenue_row = row
+                        break
 
-            # Values (in millions)
-            tds = revenue_row.find_all("td")[1:1 + len(date_labels)]
-            values_mil = [money_to_float(td.get_text(" ", strip=True)) for td in tds]
+            if not revenue_row:
+                raise ValueError("Revenue row not found in table")
 
-            # Dates: stockanalysis often shows "Sep 30, 2025" or "Sep '25"
+            # Parse revenue values
+            values = []
+            for td in revenue_row.find_all("td")[1:len(dates)+1]:
+                val_text = td.get_text(strip=True).replace(",", "")
+                values.append(money_to_float(val_text))
+
+            # Create dataframe
             df_data = []
-            for i, lbl in enumerate(date_labels):
-                if i >= len(values_mil):
-                    continue
-                v_mil = values_mil[i]
-                if np.isnan(v_mil):
-                    continue
-
-                dt = pd.to_datetime(lbl, errors="coerce")
-                if pd.isna(dt):
-                    # try "Sep '25" format
+            for i, date_str in enumerate(dates):
+                if i < len(values):
                     try:
-                        parts = lbl.replace("'", "").split()
+                        parts = date_str.replace("'", "").split()
                         if len(parts) == 2:
                             month_str, year_str = parts
                             year = int("20" + year_str) if len(year_str) == 2 else int(year_str)
-                            dt = pd.to_datetime(f"{month_str} {year}", format="%b %Y", errors="coerce")
-                    except Exception:
-                        dt = pd.NaT
+                            date_obj = pd.to_datetime(f"{month_str} {year}", format="%b %Y")
+                            date_obj = snap_to_quarter_end(date_obj)
+                            df_data.append({"date": date_obj, "revenue": values[i] * 1e6})  # millions -> dollars
+                    except:
+                        continue
 
-                if pd.isna(dt):
-                    continue
-
-                dt = snap_to_quarter_end(dt)
-                df_data.append({"date": dt, "revenue": float(v_mil) * 1e6})  # millions -> dollars
-
-            df = pd.DataFrame(df_data).dropna()
+            df = pd.DataFrame(df_data)
             if df.empty or len(df) < 4:
-                raise ValueError("Insufficient quarterly revenue parsed from financials")
+                raise ValueError("Insufficient quarterly data parsed")
 
             return df.sort_values("date").reset_index(drop=True)
 
@@ -409,6 +434,7 @@ def load_total_revenue_from_financials() -> pd.DataFrame:
 # FORECASTING
 # =============================
 def estimate_growth_q(series: pd.Series, lookback_quarters: int = 8) -> Tuple[float, float]:
+    """Estimate quarterly growth rate and volatility"""
     s = series.dropna().astype(float)
     if len(s) < 6:
         return 0.02, 0.05
@@ -420,6 +446,7 @@ def estimate_growth_q(series: pd.Series, lookback_quarters: int = 8) -> Tuple[fl
 
 
 def forecast_series(hist_df: pd.DataFrame, years: int, uplift_annual: float, lookback_quarters: int = 8) -> pd.DataFrame:
+    """Generate forecast with uncertainty bands"""
     df = hist_df.sort_values("date").copy()
     df = df.dropna(subset=["revenue"])
     if df.empty:
@@ -462,7 +489,7 @@ with col2:
         """
         # Alphabet (Google) Revenue Forecast Dashboard
         Interactive segment-level **quarterly** analysis and scenario forecasting.  
-        **Data sources:** StockAnalysis (segment revenue + total revenue income statement for validation)
+        **Data sources:** StockAnalysis (segment revenue) + StockAnalysis Revenue History (total revenue)
         """
     )
 
@@ -509,9 +536,6 @@ with st.spinner("Loading segment data from StockAnalysis..."):
         st.error(f"Failed to load segment data: {str(e)}")
         st.stop()
 
-with st.spinner("Loading total revenue validation (StockAnalysis financials)..."):
-    fin_total = load_total_revenue_from_financials()
-
 products = sorted(seg_q["product"].unique().tolist())
 default_product = "Advertising" if "Advertising" in products else products[0]
 product = st.sidebar.selectbox("Product Segment", products, index=products.index(default_product))
@@ -520,14 +544,16 @@ product = st.sidebar.selectbox("Product Segment", products, index=products.index
 # =============================
 # TABS
 # =============================
-tab1, tab2, tab3, tab4 = st.tabs(["Segment Forecast", "Total Revenue Forecast", "Data Check", "Download"])
-
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Segment Forecast", "Total Revenue Forecast", "Data Check", "Download"]
+)
 
 # TAB 1: SEGMENT FORECAST
 with tab1:
     st.subheader(f"Revenue Forecast: {product}")
 
     seg = seg_q[seg_q["product"] == product].copy().sort_values("date")
+
     if seg.empty:
         st.warning(f"No data available for {product}")
     else:
@@ -546,11 +572,11 @@ with tab1:
         else:
             cagr = np.nan
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Last Reported (Quarterly)", money_fmt(last_q_rev), last_q_date.strftime("%b %Y"))
-        c2.metric("End Forecast", money_fmt(end_fc), f"+{money_fmt(end_fc - last_q_rev)}" if not np.isnan(end_fc) else "—")
-        c3.metric("Uplift vs Baseline", money_fmt(delta), f"+{uplift*100:.0f}% scenario")
-        c4.metric("Implied CAGR", f"{cagr:.1f}%" if not np.isnan(cagr) else "—")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Last Reported (Quarterly)", money_fmt(last_q_rev), last_q_date.strftime("%b %Y"))
+        col2.metric("End Forecast", money_fmt(end_fc), f"+{money_fmt(end_fc - last_q_rev)}" if not np.isnan(end_fc) else "—")
+        col3.metric("Uplift vs Baseline", money_fmt(delta), f"+{uplift*100:.0f}% scenario")
+        col4.metric("Implied CAGR", f"{cagr:.1f}%" if not np.isnan(cagr) else "—")
 
         fig = build_plot_lines(
             seg[["date", "revenue"]],
@@ -564,54 +590,27 @@ with tab1:
             recent = seg.tail(12).copy()
             recent["Period"] = pd.to_datetime(recent["date"]).dt.strftime("%b %Y")
             recent["Revenue"] = recent["revenue"].apply(money_fmt)
-            recent["QoQ Growth"] = seg["revenue"].pct_change().tail(12).apply(
-                lambda x: f"{x*100:.1f}%" if not np.isnan(x) else "—"
-            )
+            recent["QoQ Growth"] = seg["revenue"].pct_change().tail(12).apply(lambda x: f"{x*100:.1f}%" if not np.isnan(x) else "—")
             st.dataframe(recent[["Period", "Revenue", "QoQ Growth"]].iloc[::-1], use_container_width=True)
 
-
-# TAB 2: TOTAL FORECAST
+# TAB 2: TOTAL FORECAST (✅ NOW USES /revenue/ QUARTERLY HISTORY TO MATCH WEBSITE)
 with tab2:
     st.subheader("Total Alphabet Revenue Forecast")
 
-    # Historical TOTAL from segment sums (with total-like columns removed)
-    total_hist, removed_cols = segment_sum_total_from_quarterly(seg_q)
+    # ✅ Official quarterly total revenue history from StockAnalysis /revenue/
+    total_hist = load_total_revenue_from_revenue_page()
+    total_hist = total_hist.sort_values("date").dropna(subset=["revenue"])
 
-    # Forecast TOTAL by forecasting each segment (after removing total-like segments)
-    wide_q = (
-        seg_q.pivot_table(index="date", columns="product", values="revenue", aggfunc="sum")
-        .sort_index()
-        .reset_index()
+    # ✅ Forecast TOTAL directly from the same history
+    total_fc = forecast_series(
+        total_hist[["date", "revenue"]],
+        years=years,
+        uplift_annual=uplift,
+        lookback_quarters=lookback
     )
-    removed_for_forecast = detect_total_like_columns(wide_q, tol=0.02, min_quarters=6)
 
-    # Build future index
-    future_steps = years * 4
-    last_date = pd.to_datetime(wide_q["date"].max())
-    future_dates = pd.date_range(last_date + pd.offsets.QuarterEnd(1), periods=future_steps, freq="Q")
-    future_dates = pd.to_datetime(pd.Series(future_dates).apply(snap_to_quarter_end))
-
-    total_fc_vals = np.zeros(future_steps, dtype=float)
-    total_hi_vals = np.zeros(future_steps, dtype=float)
-    total_lo_vals = np.zeros(future_steps, dtype=float)
-
-    seg_cols = [c for c in wide_q.columns if c not in ["date"] + removed_for_forecast]
-
-    for p in seg_cols:
-        hist_p = wide_q[["date", p]].rename(columns={p: "revenue"}).dropna(subset=["revenue"])
-        if hist_p.empty:
-            continue
-        fcp = forecast_series(hist_p, years=years, uplift_annual=uplift, lookback_quarters=lookback)
-        if fcp.empty:
-            continue
-        total_fc_vals += fcp["forecast"].values
-        total_hi_vals += fcp["hi"].values
-        total_lo_vals += fcp["lo"].values
-
-    total_fc = pd.DataFrame({"date": future_dates, "forecast": total_fc_vals, "hi": total_hi_vals, "lo": total_lo_vals})
-
-    # Metrics
-    last_q_total = float(total_hist.loc[total_hist["date"] == total_hist["date"].max(), "revenue"].iloc[-1])
+    last_q_date = pd.to_datetime(total_hist["date"].max())
+    last_q_total = float(total_hist.loc[total_hist["date"] == last_q_date, "revenue"].iloc[-1])
     end_fc_total = float(total_fc["forecast"].iloc[-1]) if not total_fc.empty else np.nan
 
     if not np.isnan(end_fc_total) and last_q_total > 0:
@@ -619,10 +618,10 @@ with tab2:
     else:
         cagr_total = np.nan
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Last Reported Total (Segments Sum)", money_fmt(last_q_total), pd.to_datetime(total_hist["date"].max()).strftime("%b %Y"))
-    c2.metric("Forecasted Total", money_fmt(end_fc_total), f"+{money_fmt(end_fc_total - last_q_total)}" if not np.isnan(end_fc_total) else "—")
-    c3.metric("Implied CAGR", f"{cagr_total:.1f}%" if not np.isnan(cagr_total) else "—")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Last Reported Total", money_fmt(last_q_total), last_q_date.strftime("%b %Y"))
+    col2.metric("Forecasted Total", money_fmt(end_fc_total), f"+{money_fmt(end_fc_total - last_q_total)}" if not np.isnan(end_fc_total) else "—")
+    col3.metric("Implied CAGR", f"{cagr_total:.1f}%" if not np.isnan(cagr_total) else "—")
 
     fig_total = build_plot_lines(
         total_hist[["date", "revenue"]],
@@ -632,101 +631,76 @@ with tab2:
     )
     st.plotly_chart(fig_total, use_container_width=True)
 
-    if removed_for_forecast:
-        st.caption(f"Removed total-like columns to prevent double counting: {', '.join(removed_for_forecast)}")
-
+    with st.expander("View recent quarterly total revenue (matches StockAnalysis /revenue/)"):
+        recent_total = total_hist.tail(12).copy()
+        recent_total["Period"] = pd.to_datetime(recent_total["date"]).dt.strftime("%b %Y")
+        recent_total["Revenue"] = recent_total["revenue"].apply(money_fmt)
+        recent_total["QoQ Growth"] = total_hist["revenue"].pct_change().tail(12).apply(
+            lambda x: f"{x*100:.1f}%" if not np.isnan(x) else "—"
+        )
+        st.dataframe(recent_total[["Period", "Revenue", "QoQ Growth"]].iloc[::-1], use_container_width=True)
 
 # TAB 3: DATA CHECK
 with tab3:
-    st.subheader("Data Quality Check (Segments vs Total)")
+    st.subheader("Segment Data Quality Check")
 
-    latest_dt = pd.to_datetime(seg_q["date"].max())
-    st.info(f"**Latest quarter in segment dataset:** {latest_dt.strftime('%b %d, %Y')}")
+    latest_dt = seg_q["date"].max()
+    latest_dt_str = pd.to_datetime(latest_dt).strftime("%b %d, %Y")
 
-    days_old = (pd.Timestamp.now() - latest_dt).days
+    st.info(f"**Latest quarter in dataset:** {latest_dt_str}")
+
+    days_old = (pd.Timestamp.now() - pd.Timestamp(latest_dt)).days
     if days_old > 120:
         st.warning(f"Data may be stale ({days_old} days old). Consider refreshing.")
 
-    # Latest quarter breakdown
     chk = seg_q[seg_q["date"] == latest_dt].copy().sort_values("revenue", ascending=False)
-    chk["Revenue"] = chk["revenue"].apply(money_fmt)
+    chk["revenue_fmt"] = chk["revenue"].apply(money_fmt)
     chk["% of Total"] = (chk["revenue"] / chk["revenue"].sum() * 100).apply(lambda x: f"{x:.1f}%")
 
-    st.subheader("Latest Quarter Segment Mix")
     st.dataframe(
-        chk[["product", "Revenue", "% of Total"]].rename(columns={"product": "Segment"}),
+        chk[["product", "revenue_fmt", "% of Total"]].rename(columns={
+            "product": "Segment",
+            "revenue_fmt": "Revenue"
+        }),
         use_container_width=True,
         hide_index=True
     )
 
     st.markdown("---")
-    st.subheader("TOTAL Validation")
-
-    total_hist, removed_cols = segment_sum_total_from_quarterly(seg_q)
-    total_hist = total_hist.sort_values("date").reset_index(drop=True)
-
-    if fin_total is None or fin_total.empty:
-        st.warning("Financials total revenue could not be loaded for validation.")
-    else:
-        # align on common dates
-        merged = pd.merge(
-            total_hist.rename(columns={"revenue": "segments_total"}),
-            fin_total.rename(columns={"revenue": "financials_total"}),
-            on="date",
-            how="inner"
-        ).sort_values("date")
-
-        if merged.empty:
-            st.warning("No overlapping dates between segment history and financials total.")
-        else:
-            merged["Gap (Segments - Financials)"] = merged["segments_total"] - merged["financials_total"]
-            merged["Gap %"] = np.where(
-                merged["financials_total"] != 0,
-                merged["Gap (Segments - Financials)"] / merged["financials_total"] * 100,
-                np.nan
-            )
-
-            show = merged.tail(12).copy()
-            show["Period"] = pd.to_datetime(show["date"]).dt.strftime("%b %Y")
-            show["Segments Total"] = show["segments_total"].apply(money_fmt)
-            show["Financials Total"] = show["financials_total"].apply(money_fmt)
-            show["Gap"] = show["Gap (Segments - Financials)"].apply(money_fmt)
-            show["Gap %"] = show["Gap %"].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "—")
-
-            st.dataframe(
-                show[["Period", "Segments Total", "Financials Total", "Gap", "Gap %"]].iloc[::-1],
-                use_container_width=True,
-                hide_index=True
-            )
-
-            if removed_cols:
-                st.caption(f"Removed total-like columns for segment-sum TOTAL: {', '.join(removed_cols)}")
-
-    st.markdown("---")
     st.subheader("Data Availability by Segment")
+
     avail = seg_q.groupby("product").agg(
         first_date=("date", "min"),
         last_date=("date", "max"),
         num_quarters=("date", "count")
     ).reset_index()
-    avail["First Quarter"] = pd.to_datetime(avail["first_date"]).dt.strftime("%b %Y")
-    avail["Last Quarter"] = pd.to_datetime(avail["last_date"]).dt.strftime("%b %Y")
-    avail = avail.drop(columns=["first_date", "last_date"]).rename(columns={"product": "Segment", "num_quarters": "# Quarters"})
-    st.dataframe(avail, use_container_width=True, hide_index=True)
+    avail["first_date"] = pd.to_datetime(avail["first_date"]).dt.strftime("%b %Y")
+    avail["last_date"] = pd.to_datetime(avail["last_date"]).dt.strftime("%b %Y")
 
+    st.dataframe(
+        avail.rename(columns={
+            "product": "Segment",
+            "first_date": "First Quarter",
+            "last_date": "Last Quarter",
+            "num_quarters": "# Quarters"
+        }),
+        use_container_width=True,
+        hide_index=True
+    )
 
 # TAB 4: DOWNLOAD
 with tab4:
     st.subheader("Download Data")
+
     st.markdown("Export the underlying data used in this dashboard for further analysis.")
 
     seg_download = seg_q.copy()
     seg_download["revenue"] = seg_download["revenue"].astype(float)
     seg_download["date"] = pd.to_datetime(seg_download["date"]).dt.strftime("%Y-%m-%d")
 
-    c1, c2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
-    with c1:
+    with col1:
         st.download_button(
             label="Download Segment Data (Tidy Format)",
             data=seg_download.to_csv(index=False).encode("utf-8"),
@@ -739,7 +713,7 @@ with tab4:
     wide_out.reset_index(inplace=True)
     wide_out["date"] = pd.to_datetime(wide_out["date"]).dt.strftime("%Y-%m-%d")
 
-    with c2:
+    with col2:
         st.download_button(
             label="Download Segment Data (Wide Format)",
             data=wide_out.to_csv(index=False).encode("utf-8"),
