@@ -154,22 +154,88 @@ def build_plot_lines(hist: pd.DataFrame, fc: pd.DataFrame, title: str, y_title: 
 
 
 # =============================
-# LOAD SEGMENT DATA FROM CSV
+# STOCKANALYSIS SEGMENT SCRAPE (QUARTERLY)
 # =============================
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def load_revenue_by_segment_quarterly() -> pd.DataFrame:
-    """Load segment revenue data from uploaded CSV"""
-    try:
-        # Try to read the uploaded file
-        df = pd.read_csv('alphabet_revenue_by_segment_tidy.csv')
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values(['product', 'date']).reset_index(drop=True)
-        return df
-    except FileNotFoundError:
-        st.error("CSV file not found. Please ensure 'alphabet_revenue_by_segment_tidy.csv' is in the same directory.")
-        return pd.DataFrame(columns=['date', 'product', 'revenue'])
-    except Exception as e:
-        st.error(f"Error loading CSV: {str(e)}")
-        return pd.DataFrame(columns=['date', 'product', 'revenue'])
+    """Scrape quarterly segment revenue from StockAnalysis"""
+    for attempt, headers in enumerate(UA_HEADERS_LIST, 1):
+        try:
+            time.sleep(0.5)
+            r = requests.get(SEGMENT_URL, headers=headers, timeout=30)
+            r.raise_for_status()
+            
+            soup = BeautifulSoup(r.text, "lxml")
+
+            # Find the History section
+            history_h = None
+            for h in soup.find_all(["h2", "h3"]):
+                if "history" in h.get_text(strip=True).lower():
+                    history_h = h
+                    break
+
+            table = history_h.find_next("table") if history_h else None
+            if table is None:
+                tables = soup.find_all("table")
+                if not tables:
+                    raise ValueError("No tables found on StockAnalysis page.")
+                table = max(tables, key=lambda t: len(t.find_all("tr")))
+
+            thead = table.find("thead")
+            if thead:
+                headers = [c.get_text(" ", strip=True) for c in thead.find_all(["th", "td"])]
+            else:
+                first_row = table.find("tr")
+                headers = [c.get_text(" ", strip=True) for c in first_row.find_all(["th", "td"])]
+
+            headers = [h.replace("\xa0", " ").strip() for h in headers]
+            if headers and headers[0].lower() != "date":
+                headers[0] = "Date"
+
+            rows = []
+            tbody = table.find("tbody") or table
+            for tr in tbody.find_all("tr"):
+                cells = tr.find_all(["td", "th"])
+                if not cells:
+                    continue
+                vals = [c.get_text(" ", strip=True).replace("\xa0", " ") for c in cells]
+                if vals and vals[0].lower() == "date":
+                    continue
+
+                if len(vals) < len(headers):
+                    vals = vals + [""] * (len(headers) - len(vals))
+                elif len(vals) > len(headers):
+                    vals = vals[: len(headers)]
+
+                rows.append(vals)
+
+            wide = pd.DataFrame(rows, columns=headers)
+            wide.rename(columns={"Date": "date"}, inplace=True)
+            wide["date"] = pd.to_datetime(wide["date"], errors="coerce")
+            wide = wide.dropna(subset=["date"]).copy()
+
+            for c in wide.columns:
+                if c != "date":
+                    wide[c] = wide[c].apply(money_to_float)
+
+            wide = wide.sort_values("date").reset_index(drop=True)
+            tidy = wide.melt("date", var_name="product", value_name="revenue").dropna()
+            tidy = tidy.sort_values(["product", "date"]).reset_index(drop=True)
+            tidy["date"] = pd.to_datetime(tidy["date"])
+            
+            # Validation
+            if len(tidy) < 10:
+                raise ValueError(f"Too few rows parsed: {len(tidy)}")
+            
+            return tidy
+            
+        except Exception as e:
+            if attempt == len(UA_HEADERS_LIST):
+                st.error(f"Failed to load StockAnalysis data after {attempt} attempts: {str(e)}")
+                raise
+            continue
+    
+    raise ValueError("Failed to load segment data")
 
 
 def segment_sum_total_from_quarterly(seg_q: pd.DataFrame) -> pd.DataFrame:
@@ -242,7 +308,7 @@ with col2:
         """
         # Alphabet (Google) Revenue Forecast Dashboard
         Interactive segment-level **quarterly** analysis and scenario forecasting.  
-        **Data source:** Revenue by segment (quarterly data)
+        **Data sources:** StockAnalysis (segment revenue) + WallStreetZen (total revenue validation)
         """
     )
 
@@ -281,13 +347,13 @@ st.sidebar.caption("Tip: Increase 'Extra annual growth' to model optimistic scen
 # =============================
 # LOAD DATA
 # =============================
-seg_q = load_revenue_by_segment_quarterly()
-
-if seg_q.empty:
-    st.error("No data loaded. Please check the CSV file.")
-    st.stop()
-
-st.sidebar.success(f"Loaded {len(seg_q)} segment records")
+with st.spinner("Loading segment data from StockAnalysis..."):
+    try:
+        seg_q = load_revenue_by_segment_quarterly()
+        st.sidebar.success(f"Loaded {len(seg_q)} segment records")
+    except Exception as e:
+        st.error(f"Failed to load segment data: {str(e)}")
+        st.stop()
 
 products = sorted(seg_q["product"].unique().tolist())
 default_product = "Advertising" if "Advertising" in products else products[0]
